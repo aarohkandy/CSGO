@@ -12,9 +12,10 @@ Discord bot that turns emoji reactions into shared name-color roles.
    ```
 
 3. Copy `.env.example` to `.env` and set `DISCORD_BOT_TOKEN`.
-4. In the Discord developer portal, enable:
+4. Optional: set `STATE_FILE_PATH` if you want `state.json` stored somewhere else.
+5. In the Discord developer portal, enable:
    - `Server Members Intent`
-5. Run the bot:
+6. Run the bot:
 
    ```bash
    python bot.py
@@ -29,6 +30,7 @@ Discord bot that turns emoji reactions into shared name-color roles.
 ## Notes
 
 - The picker message location is persisted in `state.json`.
+- `STATE_FILE_PATH` can point at a persistent location, which is useful for hosted deployments.
 - Global slash command sync can take a little time to appear in Discord.
 - Custom server emojis are ignored because the bot derives colors from Twemoji PNG assets.
 - For Railway deployments, set `DISCORD_BOT_TOKEN` in service variables and enable `Server Members Intent` in the Discord developer portal.

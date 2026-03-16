@@ -11,13 +11,12 @@ import discord
 import requests
 from colorthief import ColorThief
 from discord import app_commands
-from discord.ext import commands
 from dotenv import load_dotenv
 from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parent
-STATE_PATH = ROOT / "state.json"
+DEFAULT_STATE_PATH = ROOT / "state.json"
 WATCH_MESSAGE_TEXT = "React with any emoji to get a name color! 🎨"
 COLOR_ROLE_PREFIX = "color-"
 DEFAULT_COLOR = (128, 128, 128)
@@ -31,6 +30,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 LOGGER = logging.getLogger("colorseg-bot")
+
+
+def get_state_path() -> Path:
+    raw_path = os.getenv("STATE_FILE_PATH")
+    if not raw_path:
+        return DEFAULT_STATE_PATH
+
+    return Path(raw_path).expanduser()
 
 
 @dataclass
@@ -56,6 +63,7 @@ class WatchState:
         )
 
     def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as handle:
             json.dump(
                 {
@@ -128,16 +136,18 @@ def dominant_color_for_emoji(emoji: str) -> tuple[int, int, int]:
     return ColorThief(image_bytes).get_color(quality=1)
 
 
-class ColorRoleBot(commands.Bot):
+class ColorRoleBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
         intents.guild_reactions = True
         intents.members = True
 
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(intents=intents)
 
-        self.watch_state = WatchState.load(STATE_PATH)
+        self.tree = app_commands.CommandTree(self)
+        self.state_path = get_state_path()
+        self.watch_state = WatchState.load(self.state_path)
         self._resume_checked = False
         self._ignored_reaction_removals: set[tuple[int, int, str]] = set()
 
@@ -158,7 +168,7 @@ class ColorRoleBot(commands.Bot):
         self._resume_checked = True
 
         if not self.watch_state.configured:
-            LOGGER.info("No watched message configured yet.")
+            LOGGER.info("No watched message configured yet. Using state file %s.", self.state_path)
             return
 
         try:
@@ -465,7 +475,7 @@ async def here(interaction: discord.Interaction) -> None:
 
     client.watch_state.channel_id = interaction.channel.id
     client.watch_state.message_id = message.id
-    client.watch_state.save(STATE_PATH)
+    client.watch_state.save(client.state_path)
 
     await interaction.followup.send("Color role message created.", ephemeral=True)
 
@@ -478,7 +488,18 @@ def main() -> None:
         raise RuntimeError("DISCORD_BOT_TOKEN is missing from the environment.")
 
     bot = ColorRoleBot()
-    bot.run(token)
+    try:
+        bot.run(token, log_handler=None)
+    except discord.PrivilegedIntentsRequired:
+        LOGGER.error(
+            "Discord rejected the connection because Server Members Intent is "
+            "enabled in code but not in the Discord developer portal."
+        )
+        LOGGER.error(
+            "Open your application in the Discord developer portal, go to Bot, "
+            "enable Server Members Intent, save, and then redeploy Railway."
+        )
+        raise
 
 
 if __name__ == "__main__":
