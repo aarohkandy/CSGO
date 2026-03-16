@@ -24,13 +24,14 @@ Discord bot that turns emoji reactions into shared name-color roles.
 ## Usage
 
 - Invite the bot with permissions to manage roles and read message history.
-- Run `/here` once in the channel that should host the picker message.
+- Run `/here` once per server in the channel that should host the picker message.
 - Users react to that message with a standard Unicode emoji to get a shared `color-{emoji}` role.
 
 ## Notes
 
-- The picker message location is persisted in `state.json`.
+- Picker message locations are persisted per server in `state.json`.
 - `STATE_FILE_PATH` can point at a persistent location, which is useful for hosted deployments.
 - Global slash command sync can take a little time to appear in Discord.
 - Custom server emojis are ignored because the bot derives colors from Twemoji PNG assets.
+- Color roles are moved as high as the bot can manage, directly under the bot's highest role. If another role still overrides the name color, move the bot's role higher in Discord's role list.
 - For Railway deployments, set `DISCORD_BOT_TOKEN` in service variables and enable `Server Members Intent` in the Discord developer portal.

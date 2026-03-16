@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import discord
 import requests
@@ -40,39 +40,38 @@ def get_state_path() -> Path:
     return Path(raw_path).expanduser()
 
 
+def parse_snowflake(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class WatchState:
     channel_id: Optional[int] = None
     message_id: Optional[int] = None
 
     @classmethod
-    def load(cls, path: Path) -> "WatchState":
-        if not path.exists():
-            return cls()
+    def from_dict(cls, data: Any) -> Optional["WatchState"]:
+        if not isinstance(data, dict):
+            return None
 
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            LOGGER.exception("Unable to load %s. Starting with an empty state.", path)
-            return cls()
+        channel_id = parse_snowflake(data.get("channel_id"))
+        message_id = parse_snowflake(data.get("message_id"))
+        if channel_id is None or message_id is None:
+            return None
 
-        return cls(
-            channel_id=data.get("channel_id"),
-            message_id=data.get("message_id"),
-        )
+        return cls(channel_id=channel_id, message_id=message_id)
 
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "channel_id": self.channel_id,
-                    "message_id": self.message_id,
-                },
-                handle,
-                indent=2,
-            )
+    def to_dict(self) -> dict[str, int]:
+        if not self.configured:
+            raise ValueError("Cannot serialize an unconfigured watch state.")
+
+        return {
+            "channel_id": self.channel_id,
+            "message_id": self.message_id,
+        }
 
     @property
     def configured(self) -> bool:
@@ -84,6 +83,75 @@ class WatchState:
             and self.channel_id == channel_id
             and self.message_id == message_id
         )
+
+
+@dataclass
+class BotState:
+    guilds: dict[int, WatchState]
+    legacy_watch_state: Optional[WatchState] = None
+
+    @classmethod
+    def load(cls, path: Path) -> "BotState":
+        if not path.exists():
+            return cls(guilds={})
+
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            LOGGER.exception("Unable to load %s. Starting with an empty state.", path)
+            return cls(guilds={})
+
+        if not isinstance(data, dict):
+            LOGGER.warning("Unexpected state format in %s. Starting with an empty state.", path)
+            return cls(guilds={})
+
+        guild_entries = data.get("guilds")
+        if isinstance(guild_entries, dict):
+            guilds: dict[int, WatchState] = {}
+            for guild_id_raw, guild_state_raw in guild_entries.items():
+                guild_id = parse_snowflake(guild_id_raw)
+                guild_state = WatchState.from_dict(guild_state_raw)
+                if guild_id is None or guild_state is None:
+                    LOGGER.warning(
+                        "Skipping invalid guild watch entry for key %r in %s.",
+                        guild_id_raw,
+                        path,
+                    )
+                    continue
+
+                guilds[guild_id] = guild_state
+
+            return cls(guilds=guilds)
+
+        legacy_watch_state = WatchState.from_dict(data)
+        if legacy_watch_state is not None:
+            LOGGER.info("Loaded legacy global watch state from %s.", path)
+
+        return cls(guilds={}, legacy_watch_state=legacy_watch_state)
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "guilds": {
+                        str(guild_id): guild_state.to_dict()
+                        for guild_id, guild_state in sorted(self.guilds.items())
+                    }
+                },
+                handle,
+                indent=2,
+            )
+
+    def get_guild_state(self, guild_id: int) -> Optional[WatchState]:
+        return self.guilds.get(guild_id)
+
+    def set_guild_state(self, guild_id: int, guild_state: WatchState) -> None:
+        self.guilds[guild_id] = guild_state
+
+    def remove_guild_state(self, guild_id: int) -> None:
+        self.guilds.pop(guild_id, None)
 
 
 def color_role_name(emoji: str) -> str:
@@ -147,7 +215,7 @@ class ColorRoleBot(discord.Client):
 
         self.tree = app_commands.CommandTree(self)
         self.state_path = get_state_path()
-        self.watch_state = WatchState.load(self.state_path)
+        self.state = BotState.load(self.state_path)
         self._resume_checked = False
         self._ignored_reaction_removals: set[tuple[int, int, str]] = set()
 
@@ -167,27 +235,35 @@ class ColorRoleBot(discord.Client):
 
         self._resume_checked = True
 
-        if not self.watch_state.configured:
-            LOGGER.info("No watched message configured yet. Using state file %s.", self.state_path)
+        await self.migrate_legacy_state()
+
+        if not self.state.guilds:
+            LOGGER.info(
+                "No watched messages configured yet. Using state file %s.",
+                self.state_path,
+            )
             return
 
-        try:
-            channel = await self.fetch_channel(self.watch_state.channel_id)
-            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-                LOGGER.warning(
-                    "Configured channel %s cannot host the watched message.",
-                    self.watch_state.channel_id,
-                )
-                return
+        stale_guild_ids: list[int] = []
+        for guild_id, guild_state in list(self.state.guilds.items()):
+            is_valid = await self.validate_guild_watch_state(guild_id, guild_state)
+            if not is_valid:
+                stale_guild_ids.append(guild_id)
 
-            await channel.fetch_message(self.watch_state.message_id)
-            LOGGER.info(
-                "Watching configured message %s in channel %s.",
-                self.watch_state.message_id,
-                self.watch_state.channel_id,
+        if stale_guild_ids:
+            for guild_id in stale_guild_ids:
+                self.state.remove_guild_state(guild_id)
+
+            self.state.save(self.state_path)
+            LOGGER.warning(
+                "Pruned %s stale watched message configuration(s).",
+                len(stale_guild_ids),
             )
-        except discord.HTTPException:
-            LOGGER.exception("Unable to fetch the configured watched message.")
+
+        if not self.state.guilds:
+            LOGGER.info(
+                "No watched messages remain configured after startup validation."
+            )
 
     async def on_raw_reaction_add(
         self, payload: discord.RawReactionActionEvent
@@ -195,7 +271,8 @@ class ColorRoleBot(discord.Client):
         if self.user is not None and payload.user_id == self.user.id:
             return
 
-        if payload.guild_id is None or not self.watch_state.matches(
+        guild_watch_state = self.get_guild_watch_state(payload.guild_id)
+        if guild_watch_state is None or not guild_watch_state.matches(
             payload.channel_id, payload.message_id
         ):
             return
@@ -293,7 +370,8 @@ class ColorRoleBot(discord.Client):
         if self.user is not None and payload.user_id == self.user.id:
             return
 
-        if payload.guild_id is None or not self.watch_state.matches(
+        guild_watch_state = self.get_guild_watch_state(payload.guild_id)
+        if guild_watch_state is None or not guild_watch_state.matches(
             payload.channel_id, payload.message_id
         ):
             return
@@ -350,6 +428,7 @@ class ColorRoleBot(discord.Client):
     ) -> Optional[discord.Role]:
         existing_role = discord.utils.get(guild.roles, name=color_role_name(emoji))
         if existing_role is not None:
+            await self.ensure_color_role_position(guild, existing_role)
             return existing_role
 
         try:
@@ -362,16 +441,7 @@ class ColorRoleBot(discord.Client):
             LOGGER.exception("Unable to create color role for %s.", emoji)
             return None
 
-        me = guild.me or guild.get_member(self.user.id if self.user else 0)
-        if me is not None:
-            target_position = max(1, me.top_role.position - 1)
-            try:
-                await role.edit(
-                    position=target_position,
-                    reason="Placing new color role below the bot's top role.",
-                )
-            except discord.HTTPException:
-                LOGGER.exception("Unable to position role %s.", role.name)
+        await self.ensure_color_role_position(guild, role)
 
         return role
 
@@ -383,6 +453,145 @@ class ColorRoleBot(discord.Client):
             await role.delete(reason="Deleting unused emoji color role.")
         except discord.HTTPException:
             LOGGER.exception("Unable to delete unused role %s.", role.name)
+
+    def get_guild_watch_state(self, guild_id: Optional[int]) -> Optional[WatchState]:
+        if guild_id is None:
+            return None
+
+        return self.state.get_guild_state(guild_id)
+
+    async def ensure_color_role_position(
+        self, guild: discord.Guild, role: discord.Role
+    ) -> None:
+        me = guild.me or guild.get_member(self.user.id if self.user else 0)
+        if me is None:
+            LOGGER.warning(
+                "Unable to resolve the bot member in guild %s while positioning %s.",
+                guild.id,
+                role.name,
+            )
+            return
+
+        target_position = max(1, me.top_role.position - 1)
+        if role.position == target_position:
+            return
+
+        try:
+            await role.edit(
+                position=target_position,
+                reason="Placing color role as high as the bot can manage.",
+            )
+        except discord.HTTPException:
+            LOGGER.exception(
+                "Unable to position role %s to %s in guild %s. "
+                "The bot can only move roles below its own top role.",
+                role.name,
+                target_position,
+                guild.id,
+            )
+
+    async def migrate_legacy_state(self) -> None:
+        legacy_watch_state = self.state.legacy_watch_state
+        if legacy_watch_state is None:
+            return
+
+        self.state.legacy_watch_state = None
+
+        try:
+            channel = await self.fetch_channel(legacy_watch_state.channel_id)
+        except discord.HTTPException:
+            LOGGER.warning(
+                "Unable to resolve legacy watched channel %s. Dropping legacy state.",
+                legacy_watch_state.channel_id,
+            )
+            self.state.save(self.state_path)
+            return
+
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            LOGGER.warning(
+                "Legacy watched channel %s cannot host the picker message. "
+                "Dropping legacy state.",
+                legacy_watch_state.channel_id,
+            )
+            self.state.save(self.state_path)
+            return
+
+        try:
+            await channel.fetch_message(legacy_watch_state.message_id)
+        except discord.HTTPException:
+            LOGGER.warning(
+                "Legacy watched message %s is unavailable. Dropping legacy state.",
+                legacy_watch_state.message_id,
+            )
+            self.state.save(self.state_path)
+            return
+
+        guild_id = channel.guild.id
+        if self.state.get_guild_state(guild_id) is None:
+            self.state.set_guild_state(guild_id, legacy_watch_state)
+            LOGGER.info(
+                "Migrated legacy watched message %s to guild %s.",
+                legacy_watch_state.message_id,
+                guild_id,
+            )
+        else:
+            LOGGER.info(
+                "Dropping legacy watched message %s because guild %s already has "
+                "a guild-scoped picker.",
+                legacy_watch_state.message_id,
+                guild_id,
+            )
+
+        self.state.save(self.state_path)
+
+    async def validate_guild_watch_state(
+        self, guild_id: int, guild_watch_state: WatchState
+    ) -> bool:
+        try:
+            channel = await self.fetch_channel(guild_watch_state.channel_id)
+        except discord.HTTPException:
+            LOGGER.warning(
+                "Configured watched channel %s for guild %s could not be fetched.",
+                guild_watch_state.channel_id,
+                guild_id,
+            )
+            return False
+
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            LOGGER.warning(
+                "Configured watched channel %s for guild %s cannot host the "
+                "picker message.",
+                guild_watch_state.channel_id,
+                guild_id,
+            )
+            return False
+
+        if channel.guild.id != guild_id:
+            LOGGER.warning(
+                "Configured watched channel %s belongs to guild %s, not guild %s.",
+                guild_watch_state.channel_id,
+                channel.guild.id,
+                guild_id,
+            )
+            return False
+
+        try:
+            await channel.fetch_message(guild_watch_state.message_id)
+        except discord.HTTPException:
+            LOGGER.warning(
+                "Configured watched message %s for guild %s could not be fetched.",
+                guild_watch_state.message_id,
+                guild_id,
+            )
+            return False
+
+        LOGGER.info(
+            "Watching configured message %s in guild %s channel %s.",
+            guild_watch_state.message_id,
+            guild_id,
+            guild_watch_state.channel_id,
+        )
+        return True
 
     async def remove_other_member_reactions(
         self,
@@ -466,16 +675,18 @@ async def here(interaction: discord.Interaction) -> None:
         )
         return
 
-    if client.watch_state.configured:
+    if client.get_guild_watch_state(interaction.guild.id) is not None:
         await interaction.response.send_message("Already set!", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     message = await interaction.channel.send(WATCH_MESSAGE_TEXT)
 
-    client.watch_state.channel_id = interaction.channel.id
-    client.watch_state.message_id = message.id
-    client.watch_state.save(client.state_path)
+    client.state.set_guild_state(
+        interaction.guild.id,
+        WatchState(channel_id=interaction.channel.id, message_id=message.id),
+    )
+    client.state.save(client.state_path)
 
     await interaction.followup.send("Color role message created.", ephemeral=True)
 
