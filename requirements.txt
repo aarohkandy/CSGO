@@ -1,0 +1,5 @@
+discord.py
+Pillow
+colorthief
+python-dotenv
+requests
