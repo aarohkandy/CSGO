@@ -31,3 +31,4 @@ Discord bot that turns emoji reactions into shared name-color roles.
 - The picker message location is persisted in `state.json`.
 - Global slash command sync can take a little time to appear in Discord.
 - Custom server emojis are ignored because the bot derives colors from Twemoji PNG assets.
+- For Railway deployments, set `DISCORD_BOT_TOKEN` in service variables and enable `Server Members Intent` in the Discord developer portal.
