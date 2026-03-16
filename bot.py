@@ -585,24 +585,59 @@ class ColorRoleBot(discord.Client):
             return role
 
         target_position = max(1, me.top_role.position - 1)
+        manageable_roles_bottom_up = [
+            existing_role
+            for existing_role in guild.roles
+            if existing_role.id not in {guild.default_role.id, me.top_role.id}
+            and existing_role.position < me.top_role.position
+        ]
+        manageable_roles_top_down = list(reversed(manageable_roles_bottom_up))
+        current_top_manageable_role = (
+            manageable_roles_top_down[0] if manageable_roles_top_down else None
+        )
+
         LOGGER.info(
             "Preparing to position role %s under bot_top=%s target_position=%s",
             describe_role(role),
             describe_role(me.top_role),
             target_position,
         )
+        LOGGER.info(
+            "Current manageable order below bot: %s",
+            [describe_role(existing_role) for existing_role in manageable_roles_top_down],
+        )
 
-        if role.position == target_position:
-            LOGGER.info("Role %s is already at target position.", describe_role(role))
+        if (
+            role.position == target_position
+            and current_top_manageable_role is not None
+            and current_top_manageable_role.id == role.id
+        ):
+            LOGGER.info(
+                "Role %s is already the highest manageable role below the bot.",
+                describe_role(role),
+            )
             return role
 
         try:
-            desired_positions = {
-                existing_role: existing_role.position
-                for existing_role in guild.roles
-                if existing_role.id != role.id and existing_role.position < me.top_role.position
-            }
-            desired_positions[role] = target_position
+            other_manageable_roles_top_down = [
+                existing_role
+                for existing_role in manageable_roles_top_down
+                if existing_role.id != role.id
+            ]
+            desired_order_top_down = [role, *other_manageable_roles_top_down]
+            desired_positions: dict[discord.Role, int] = {}
+            next_position = target_position
+            for ordered_role in desired_order_top_down:
+                desired_positions[ordered_role] = next_position
+                next_position -= 1
+
+            LOGGER.info(
+                "Applying explicit manageable role order: %s",
+                [
+                    f"{describe_role(ordered_role)} -> {desired_positions[ordered_role]}"
+                    for ordered_role in desired_order_top_down
+                ],
+            )
             updated_roles = await guild.edit_role_positions(
                 positions=desired_positions,
                 reason="Placing color role as high as the bot can manage.",
