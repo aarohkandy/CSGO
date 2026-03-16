@@ -20,6 +20,7 @@ DEFAULT_STATE_PATH = ROOT / "state.json"
 WATCH_MESSAGE_TEXT = "React with any emoji to get a name color! 🎨"
 COLOR_ROLE_PREFIX = "color-"
 DEFAULT_COLOR = (128, 128, 128)
+BUILD_ID = os.getenv("RENDER_GIT_COMMIT") or os.getenv("RAILWAY_GIT_COMMIT_SHA") or "unknown"
 TWEMOJI_BASE_URL = (
     "https://cdn.jsdelivr.net/gh/twitter/twemoji/assets/72x72/{codepoints}.png"
 )
@@ -162,6 +163,10 @@ def is_color_role(role: discord.Role) -> bool:
     return role.name.startswith(COLOR_ROLE_PREFIX)
 
 
+def describe_role(role: discord.Role) -> str:
+    return f"{role.name} (id={role.id}, position={role.position})"
+
+
 def emoji_to_codepoints(emoji: str) -> str:
     codepoints = [f"{ord(char):x}" for char in emoji]
     has_zwj = "200d" in codepoints
@@ -228,7 +233,12 @@ class ColorRoleBot(discord.Client):
         if self.user is None:
             return
 
-        LOGGER.info("Logged in as %s (%s)", self.user, self.user.id)
+        LOGGER.info(
+            "Logged in as %s (%s) with build %s",
+            self.user,
+            self.user.id,
+            BUILD_ID,
+        )
 
         if self._resume_checked:
             return
@@ -301,6 +311,23 @@ class ColorRoleBot(discord.Client):
         if emoji is None:
             return
 
+        LOGGER.info(
+            "Reaction add received: guild=%s (%s) channel=%s message=%s member=%s (%s) "
+            "emoji=%s",
+            guild.name,
+            guild.id,
+            payload.channel_id,
+            payload.message_id,
+            member,
+            member.id,
+            emoji,
+        )
+        LOGGER.info(
+            "Hierarchy snapshot before assignment: bot_top=%s member_top=%s",
+            describe_role(guild.me.top_role) if guild.me else "unknown",
+            describe_role(member.top_role),
+        )
+
         try:
             rgb = await asyncio.to_thread(dominant_color_for_emoji, emoji)
         except requests.RequestException:
@@ -316,15 +343,111 @@ class ColorRoleBot(discord.Client):
             )
             rgb = DEFAULT_COLOR
 
-        role = await self.get_or_create_color_role(guild, emoji, rgb)
+        role, created_new_role = await self.get_or_create_color_role(guild, emoji, rgb)
         if role is None:
             return
+
+        LOGGER.info(
+            "Color role ready for assignment: created=%s role=%s",
+            created_new_role,
+            describe_role(role),
+        )
 
         old_roles = [
             existing_role
             for existing_role in member.roles
             if is_color_role(existing_role) and existing_role.id != role.id
         ]
+        LOGGER.info(
+            "Existing color roles on member %s before swap: %s",
+            member.id,
+            [describe_role(existing_role) for existing_role in old_roles],
+        )
+
+        if guild.me is None:
+            LOGGER.warning(
+                "Bot member cache is unavailable in guild %s during assignment.",
+                guild.id,
+            )
+            if created_new_role:
+                await self.delete_role_if_unused(role)
+            return
+
+        if guild.me.top_role.position <= member.top_role.position:
+            LOGGER.error(
+                "Cannot assign %s to member %s because bot_top=%s is not above member_top=%s.",
+                role.name,
+                member.id,
+                describe_role(guild.me.top_role),
+                describe_role(member.top_role),
+            )
+            if created_new_role:
+                await self.delete_role_if_unused(role)
+            return
+
+        if guild.me.top_role.position <= role.position:
+            LOGGER.error(
+                "Cannot assign %s because bot_top=%s is not above role=%s after positioning.",
+                role.name,
+                describe_role(guild.me.top_role),
+                describe_role(role),
+            )
+            if created_new_role:
+                await self.delete_role_if_unused(role)
+            return
+
+        member_has_role = any(existing_role.id == role.id for existing_role in member.roles)
+        if not member_has_role:
+            try:
+                await member.add_roles(
+                    role,
+                    reason="Assigning emoji color role from watched reaction message.",
+                )
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "Unable to add role %s to member %s. bot_top=%s member_top=%s role=%s",
+                    role.id,
+                    member.id,
+                    describe_role(guild.me.top_role),
+                    describe_role(member.top_role),
+                    describe_role(role),
+                )
+                if created_new_role:
+                    await self.delete_role_if_unused(role)
+                return
+
+        try:
+            verified_member = await guild.fetch_member(member.id)
+        except discord.HTTPException:
+            LOGGER.exception(
+                "Unable to refetch member %s after assigning role %s.",
+                member.id,
+                role.id,
+            )
+            if created_new_role:
+                await self.delete_role_if_unused(role)
+            return
+
+        if all(existing_role.id != role.id for existing_role in verified_member.roles):
+            LOGGER.error(
+                "Role assignment verification failed for member %s and role %s. "
+                "member_top=%s role=%s",
+                verified_member.id,
+                role.id,
+                describe_role(verified_member.top_role),
+                describe_role(role),
+            )
+            if created_new_role:
+                await self.delete_role_if_unused(role)
+            return
+
+        member = verified_member
+        LOGGER.info(
+            "Role assignment verified: member=%s role=%s final_member_top=%s",
+            member.id,
+            describe_role(role),
+            describe_role(member.top_role),
+        )
 
         if old_roles:
             try:
@@ -334,22 +457,9 @@ class ColorRoleBot(discord.Client):
                 )
             except discord.HTTPException:
                 LOGGER.exception(
-                    "Unable to remove old color roles from member %s.",
+                    "Unable to remove old color roles from member %s after verifying new role %s.",
                     member.id,
-                )
-                return
-
-        if role not in member.roles:
-            try:
-                await member.add_roles(
-                    role,
-                    reason="Assigning emoji color role from watched reaction message.",
-                )
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "Unable to add role %s to member %s.",
                     role.id,
-                    member.id,
                 )
                 return
 
@@ -425,11 +535,12 @@ class ColorRoleBot(discord.Client):
 
     async def get_or_create_color_role(
         self, guild: discord.Guild, emoji: str, rgb: tuple[int, int, int]
-    ) -> Optional[discord.Role]:
+    ) -> tuple[Optional[discord.Role], bool]:
         existing_role = discord.utils.get(guild.roles, name=color_role_name(emoji))
         if existing_role is not None:
-            await self.ensure_color_role_position(guild, existing_role)
-            return existing_role
+            LOGGER.info("Reusing existing color role %s", describe_role(existing_role))
+            positioned_role = await self.ensure_color_role_position(guild, existing_role)
+            return positioned_role, False
 
         try:
             role = await guild.create_role(
@@ -439,11 +550,12 @@ class ColorRoleBot(discord.Client):
             )
         except discord.HTTPException:
             LOGGER.exception("Unable to create color role for %s.", emoji)
-            return None
+            return None, False
 
-        await self.ensure_color_role_position(guild, role)
+        LOGGER.info("Created new color role %s", describe_role(role))
+        positioned_role = await self.ensure_color_role_position(guild, role)
 
-        return role
+        return positioned_role, True
 
     async def delete_role_if_unused(self, role: discord.Role) -> None:
         if role.members:
@@ -462,7 +574,7 @@ class ColorRoleBot(discord.Client):
 
     async def ensure_color_role_position(
         self, guild: discord.Guild, role: discord.Role
-    ) -> None:
+    ) -> discord.Role:
         me = guild.me or guild.get_member(self.user.id if self.user else 0)
         if me is None:
             LOGGER.warning(
@@ -470,15 +582,29 @@ class ColorRoleBot(discord.Client):
                 guild.id,
                 role.name,
             )
-            return
+            return role
 
         target_position = max(1, me.top_role.position - 1)
+        LOGGER.info(
+            "Preparing to position role %s under bot_top=%s target_position=%s",
+            describe_role(role),
+            describe_role(me.top_role),
+            target_position,
+        )
+
         if role.position == target_position:
-            return
+            LOGGER.info("Role %s is already at target position.", describe_role(role))
+            return role
 
         try:
-            await role.edit(
-                position=target_position,
+            desired_positions = {
+                existing_role: existing_role.position
+                for existing_role in guild.roles
+                if existing_role.id != role.id and existing_role.position < me.top_role.position
+            }
+            desired_positions[role] = target_position
+            updated_roles = await guild.edit_role_positions(
+                positions=desired_positions,
                 reason="Placing color role as high as the bot can manage.",
             )
         except discord.HTTPException:
@@ -489,6 +615,37 @@ class ColorRoleBot(discord.Client):
                 target_position,
                 guild.id,
             )
+            return role
+
+        refreshed_role = discord.utils.get(updated_roles, id=role.id)
+        if refreshed_role is None:
+            refreshed_role = discord.utils.get(guild.roles, id=role.id)
+        if refreshed_role is None:
+            try:
+                refreshed_role = discord.utils.get(await guild.fetch_roles(), id=role.id)
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "Unable to refetch roles for guild %s after positioning role %s.",
+                    guild.id,
+                    role.id,
+                )
+                return role
+
+        if refreshed_role is None:
+            LOGGER.warning(
+                "Role %s disappeared after attempting to reposition it in guild %s.",
+                role.id,
+                guild.id,
+            )
+            return role
+
+        LOGGER.info(
+            "Role positioning result: role=%s target_position=%s actual_position=%s",
+            describe_role(refreshed_role),
+            target_position,
+            refreshed_role.position,
+        )
+        return refreshed_role
 
     async def migrate_legacy_state(self) -> None:
         legacy_watch_state = self.state.legacy_watch_state
