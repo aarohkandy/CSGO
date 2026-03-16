@@ -383,6 +383,8 @@ class ColorRoleBot(commands.Bot):
         keep_emoji: str,
     ) -> None:
         channel = guild.get_channel(channel_id)
+        if channel is None and hasattr(guild, "get_thread"):
+            channel = guild.get_thread(channel_id)
         if channel is None:
             try:
                 channel = await self.fetch_channel(channel_id)
@@ -405,7 +407,7 @@ class ColorRoleBot(commands.Bot):
                 continue
 
             try:
-                async for user in reaction.users():
+                async for user in reaction.users(limit=None):
                     if user.id != member.id:
                         continue
 
