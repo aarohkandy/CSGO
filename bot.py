@@ -771,6 +771,16 @@ class ColorRoleBot(discord.Client):
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
 
+        permissions = channel.permissions_for(guild.me) if guild.me is not None else None
+        LOGGER.info(
+            "Starting reaction pruning for member=%s keep_emoji=%s channel=%s "
+            "manage_messages=%s",
+            member.id,
+            keep_emoji,
+            channel.id,
+            permissions.manage_messages if permissions is not None else "unknown",
+        )
+
         try:
             message = await channel.fetch_message(message_id)
         except discord.HTTPException:
@@ -780,24 +790,60 @@ class ColorRoleBot(discord.Client):
         for reaction in message.reactions:
             reaction_emoji = str(reaction.emoji)
             if reaction_emoji == keep_emoji:
+                LOGGER.info(
+                    "Skipping kept reaction %s for member %s.",
+                    reaction_emoji,
+                    member.id,
+                )
                 continue
+
+            LOGGER.info(
+                "Inspecting reaction %s for member %s during pruning.",
+                reaction_emoji,
+                member.id,
+            )
+
+            found_member_reaction = False
 
             try:
                 async for user in reaction.users(limit=None):
                     if user.id != member.id:
                         continue
 
+                    found_member_reaction = True
                     self._ignored_reaction_removals.add(
                         (message.id, member.id, reaction_emoji)
                     )
                     await message.remove_reaction(reaction.emoji, member)
+                    LOGGER.info(
+                        "Removed reaction %s for member %s from watched message %s.",
+                        reaction_emoji,
+                        member.id,
+                        message.id,
+                    )
                     break
             except discord.HTTPException:
                 LOGGER.exception(
-                    "Unable to prune reaction %s for member %s.",
+                    "Unable to prune reaction %s for member %s. manage_messages=%s",
                     reaction_emoji,
                     member.id,
+                    permissions.manage_messages if permissions is not None else "unknown",
                 )
+
+            if not found_member_reaction:
+                LOGGER.info(
+                    "Member %s did not have reaction %s on watched message %s.",
+                    member.id,
+                    reaction_emoji,
+                    message.id,
+                )
+
+        LOGGER.info(
+            "Finished reaction pruning for member=%s keep_emoji=%s message=%s",
+            member.id,
+            keep_emoji,
+            message.id,
+        )
 
 
 @app_commands.command(
@@ -832,18 +878,67 @@ async def here(interaction: discord.Interaction) -> None:
         )
         return
 
+    LOGGER.info(
+        "/here invoked: guild=%s (%s) channel=%s member=%s (%s) build=%s",
+        interaction.guild.name,
+        interaction.guild.id,
+        interaction.channel.id,
+        member,
+        member.id,
+        BUILD_ID,
+    )
+
     if client.get_guild_watch_state(interaction.guild.id) is not None:
+        LOGGER.info(
+            "/here skipped because guild %s already has a picker configured.",
+            interaction.guild.id,
+        )
         await interaction.response.send_message("Already set!", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
-    message = await interaction.channel.send(WATCH_MESSAGE_TEXT)
+    await interaction.response.send_message(
+        "Creating the color role message here...",
+        ephemeral=True,
+    )
+
+    try:
+        message = await interaction.channel.send(WATCH_MESSAGE_TEXT)
+    except discord.HTTPException:
+        LOGGER.exception(
+            "Unable to send watched picker message in guild %s channel %s.",
+            interaction.guild.id,
+            interaction.channel.id,
+        )
+        await interaction.followup.send(
+            "I couldn't post the picker message in this channel.",
+            ephemeral=True,
+        )
+        return
 
     client.state.set_guild_state(
         interaction.guild.id,
         WatchState(channel_id=interaction.channel.id, message_id=message.id),
     )
-    client.state.save(client.state_path)
+    try:
+        client.state.save(client.state_path)
+    except OSError:
+        LOGGER.exception(
+            "Unable to save picker state for guild %s after posting message %s.",
+            interaction.guild.id,
+            message.id,
+        )
+        await interaction.followup.send(
+            "I posted the message, but saving the picker state failed.",
+            ephemeral=True,
+        )
+        return
+
+    LOGGER.info(
+        "/here configured picker successfully: guild=%s channel=%s message=%s",
+        interaction.guild.id,
+        interaction.channel.id,
+        message.id,
+    )
 
     await interaction.followup.send("Color role message created.", ephemeral=True)
 
