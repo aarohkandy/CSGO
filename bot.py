@@ -187,6 +187,12 @@ class RoastGenerationError(Exception):
         self.status_code = status_code
 
 
+@dataclass
+class RoastGenerationResult:
+    text: str
+    resolved_model: Optional[str] = None
+
+
 def get_openrouter_api_key() -> Optional[str]:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if api_key is None:
@@ -203,6 +209,15 @@ def get_openrouter_model() -> str:
 
     model = model.strip()
     return model or DEFAULT_OPENROUTER_MODEL
+
+
+def get_openrouter_fallback_models() -> list[str]:
+    raw_models = os.getenv("OPENROUTER_FALLBACK_MODELS")
+    if raw_models is None:
+        return ["openrouter/free"]
+
+    models = [model.strip() for model in raw_models.split(",")]
+    return [model for model in models if model]
 
 
 def color_role_name(emoji: str) -> str:
@@ -304,9 +319,10 @@ def request_openrouter_roast(
     *,
     api_key: str,
     model: str,
+    fallback_models: list[str],
     member_name: str,
     history_messages: list[str],
-) -> str:
+) -> RoastGenerationResult:
     system_prompt = (
         "You are a savage Discord roast comic. Write exactly one paragraph of 3 to 5 "
         "sentences. Make it sharp, mocking, and specific to the supplied messages. "
@@ -324,7 +340,7 @@ def request_openrouter_roast(
         f"{format_roast_history(history_messages)}"
     )
     payload = {
-        "model": model,
+        "models": [model, *[fallback for fallback in fallback_models if fallback != model]],
         "temperature": 1.1,
         "max_tokens": ROAST_MAX_TOKENS,
         "messages": [
@@ -386,7 +402,11 @@ def request_openrouter_roast(
             status_code=response.status_code,
         )
 
-    return roast_text
+    resolved_model = response_data.get("model")
+    if not isinstance(resolved_model, str):
+        resolved_model = None
+
+    return RoastGenerationResult(text=roast_text, resolved_model=resolved_model)
 
 
 def dominant_color_for_emoji(emoji: str) -> tuple[int, int, int]:
@@ -1127,7 +1147,7 @@ class ColorRoleBot(discord.Client):
         self,
         member: discord.Member,
         history_snapshot: RoastHistorySnapshot,
-    ) -> str:
+    ) -> RoastGenerationResult:
         api_key = get_openrouter_api_key()
         if api_key is None:
             raise RoastGenerationError(
@@ -1135,11 +1155,13 @@ class ColorRoleBot(discord.Client):
             )
 
         model = get_openrouter_model()
+        fallback_models = get_openrouter_fallback_models()
         try:
             return await asyncio.to_thread(
                 request_openrouter_roast,
                 api_key=api_key,
                 model=model,
+                fallback_models=fallback_models,
                 member_name=member.display_name,
                 history_messages=history_snapshot.messages,
             )
@@ -1361,7 +1383,7 @@ async def roast(interaction: discord.Interaction) -> None:
 
     LOGGER.info(
         "Collected roast history: guild=%s channel=%s member=%s scanned_messages=%s "
-        "author_messages_seen=%s kept_messages=%s prompt_chars=%s model=%s",
+        "author_messages_seen=%s kept_messages=%s prompt_chars=%s model=%s fallback_models=%s",
         interaction.guild.id,
         interaction.channel.id,
         member.id,
@@ -1370,6 +1392,7 @@ async def roast(interaction: discord.Interaction) -> None:
         history_snapshot.kept_messages,
         history_snapshot.total_chars,
         get_openrouter_model(),
+        get_openrouter_fallback_models(),
     )
 
     if not history_snapshot.messages:
@@ -1388,7 +1411,7 @@ async def roast(interaction: discord.Interaction) -> None:
         return
 
     try:
-        roast_text = await client.generate_roast(member, history_snapshot)
+        roast_result = await client.generate_roast(member, history_snapshot)
     except RoastGenerationError as exc:
         LOGGER.warning(
             "OpenRouter roast request failed: guild=%s channel=%s member=%s model=%s "
@@ -1403,7 +1426,17 @@ async def roast(interaction: discord.Interaction) -> None:
         await interaction.followup.send(exc.user_message, ephemeral=True)
         return
 
-    escaped_roast_text = discord.utils.escape_mentions(roast_text)
+    LOGGER.info(
+        "OpenRouter roast request succeeded: guild=%s channel=%s member=%s requested_model=%s "
+        "resolved_model=%s",
+        interaction.guild.id,
+        interaction.channel.id,
+        member.id,
+        get_openrouter_model(),
+        roast_result.resolved_model or "unknown",
+    )
+
+    escaped_roast_text = discord.utils.escape_mentions(roast_result.text)
     try:
         await interaction.channel.send(
             f"{member.mention} {escaped_roast_text}",
