@@ -35,7 +35,7 @@ Discord bot that turns emoji reactions into shared name-color roles and can roas
 - Picker message locations are persisted per server in `state.json`.
 - `STATE_FILE_PATH` can point at a persistent location, which is useful for hosted deployments.
 - `OPENROUTER_MODEL` is optional and defaults to `venice/uncensored:free`.
-- `/roast` now tries a built-in fallback chain of OpenRouter models if the primary roast model is unavailable or rate-limited.
+- `/roast` now tries a built-in fallback chain of OpenRouter models if the primary roast model is unavailable or rate-limited, with confirmed free routes first and broader fallbacks after.
 - `COMMAND_GUILD_ID` is optional. Set it to your test server ID to sync slash commands only to that guild for fast iteration; leave it unset for global sync.
 - OpenRouter free models are useful for small testing but can still rate-limit or temporarily lose routing.
 - Global slash command sync can take a little time to appear in Discord when `COMMAND_GUILD_ID` is unset.

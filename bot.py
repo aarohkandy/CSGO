@@ -28,13 +28,13 @@ TWEMOJI_BASE_URL = (
 )
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_OPENROUTER_MODEL = "venice/uncensored:free"
-# Ranked by how explicitly the current OpenRouter model pages emphasize uncensored,
-# stripped-alignment, or NSFW-friendly creative behavior while still being usable.
+# Confirmed free routes first, then broader OpenRouter fallbacks that are more likely
+# to resolve than stale or nonexistent :free variants.
 DEFAULT_OPENROUTER_FALLBACK_MODELS = [
-    "cognitivecomputations/dolphin-llama-3-70b:free",
-    "neversleep/llama-3.1-lumimaid-70b:free",
-    "nothingiisreal/mn-celeste-12b:free",
     "nousresearch/hermes-3-llama-3.1-405b:free",
+    "openrouter/free",
+    "mistralai/mistral-small-3.2-24b-instruct:free",
+    "meta-llama/llama-3.3-8b-instruct:free",
 ]
 ROAST_HISTORY_SCAN_LIMIT = 400
 ROAST_HISTORY_MESSAGE_LIMIT = 25
