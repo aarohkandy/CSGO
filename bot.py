@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,7 +27,7 @@ TWEMOJI_BASE_URL = (
     "https://cdn.jsdelivr.net/gh/twitter/twemoji/assets/72x72/{codepoints}.png"
 )
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_OPENROUTER_MODEL = "venice/uncensored:free"
+DEFAULT_OPENROUTER_MODEL = "cognitivecomputations/dolphin-mistral-24b-venice-edition"
 ROAST_HISTORY_SCAN_LIMIT = 400
 ROAST_HISTORY_MESSAGE_LIMIT = 25
 ROAST_MESSAGE_CHAR_LIMIT = 300
@@ -181,16 +182,40 @@ class RoastHistorySnapshot:
 
 
 class RoastGenerationError(Exception):
-    def __init__(self, user_message: str, *, status_code: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        user_message: str,
+        *,
+        status_code: Optional[int] = None,
+        provider_detail: Optional[str] = None,
+    ) -> None:
         super().__init__(user_message)
         self.user_message = user_message
         self.status_code = status_code
+        self.provider_detail = provider_detail
 
 
 @dataclass
 class RoastGenerationResult:
     text: str
     resolved_model: Optional[str] = None
+
+
+@dataclass
+class RoastDebugSnapshot:
+    timestamp: str
+    guild_id: int
+    channel_id: int
+    member_id: int
+    requested_model: str
+    scanned_messages: int
+    author_messages_seen: int
+    kept_messages: int
+    prompt_chars: int
+    status_code: Optional[int] = None
+    resolved_model: Optional[str] = None
+    error_message: Optional[str] = None
+    provider_detail: Optional[str] = None
 
 
 def get_openrouter_api_key() -> Optional[str]:
@@ -209,15 +234,6 @@ def get_openrouter_model() -> str:
 
     model = model.strip()
     return model or DEFAULT_OPENROUTER_MODEL
-
-
-def get_openrouter_fallback_models() -> list[str]:
-    raw_models = os.getenv("OPENROUTER_FALLBACK_MODELS")
-    if raw_models is None:
-        return ["openrouter/free"]
-
-    models = [model.strip() for model in raw_models.split(",")]
-    return [model for model in models if model]
 
 
 def color_role_name(emoji: str) -> str:
@@ -275,6 +291,35 @@ def format_roast_history(messages: list[str]) -> str:
     return "\n".join(f"{index + 1}. {message}" for index, message in enumerate(messages))
 
 
+def extract_openrouter_error_detail(response: requests.Response) -> Optional[str]:
+    try:
+        response_data = response.json()
+    except ValueError:
+        response_text = response.text.strip()
+        return response_text[:500] if response_text else None
+
+    if not isinstance(response_data, dict):
+        return None
+
+    error = response_data.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+        metadata = error.get("metadata")
+        if isinstance(metadata, dict):
+            raw_message = metadata.get("raw")
+            if isinstance(raw_message, str) and raw_message.strip():
+                return raw_message.strip()
+
+    message = response_data.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+
+    return None
+
+
 def extract_roast_text(response_data: Any) -> Optional[str]:
     if not isinstance(response_data, dict):
         return None
@@ -319,7 +364,6 @@ def request_openrouter_roast(
     *,
     api_key: str,
     model: str,
-    fallback_models: list[str],
     member_name: str,
     history_messages: list[str],
 ) -> RoastGenerationResult:
@@ -340,7 +384,7 @@ def request_openrouter_roast(
         f"{format_roast_history(history_messages)}"
     )
     payload = {
-        "models": [model, *[fallback for fallback in fallback_models if fallback != model]],
+        "model": model,
         "temperature": 1.1,
         "max_tokens": ROAST_MAX_TOKENS,
         "messages": [
@@ -366,25 +410,30 @@ def request_openrouter_roast(
             "I couldn't reach the roast model right now. Try again in a bit."
         ) from exc
 
+    provider_detail = extract_openrouter_error_detail(response)
     if response.status_code == 401:
         raise RoastGenerationError(
             "The roast model API key is invalid or missing.",
             status_code=response.status_code,
+            provider_detail=provider_detail,
         )
     if response.status_code == 429:
         raise RoastGenerationError(
             "The roast model is rate-limited right now. Try again in a bit.",
             status_code=response.status_code,
+            provider_detail=provider_detail,
         )
     if response.status_code >= 500:
         raise RoastGenerationError(
             "The roast model provider is having issues right now.",
             status_code=response.status_code,
+            provider_detail=provider_detail,
         )
     if response.status_code >= 400:
         raise RoastGenerationError(
             "The roast model rejected the request.",
             status_code=response.status_code,
+            provider_detail=provider_detail,
         )
 
     try:
@@ -393,6 +442,7 @@ def request_openrouter_roast(
         raise RoastGenerationError(
             "The roast model returned an unreadable response.",
             status_code=response.status_code,
+            provider_detail=provider_detail,
         ) from exc
 
     roast_text = extract_roast_text(response_data)
@@ -400,6 +450,7 @@ def request_openrouter_roast(
         raise RoastGenerationError(
             "The roast model returned an empty response.",
             status_code=response.status_code,
+            provider_detail=provider_detail,
         )
 
     resolved_model = response_data.get("model")
@@ -452,10 +503,12 @@ class ColorRoleBot(discord.Client):
         self.state = BotState.load(self.state_path)
         self._resume_checked = False
         self._ignored_reaction_removals: set[tuple[int, int, str]] = set()
+        self.last_roast_debug: Optional[RoastDebugSnapshot] = None
 
     async def setup_hook(self) -> None:
         self.tree.add_command(here)
         self.tree.add_command(roast)
+        self.tree.add_command(test)
         synced = await self.tree.sync()
         LOGGER.info("Synced %s application command(s).", len(synced))
 
@@ -1155,13 +1208,11 @@ class ColorRoleBot(discord.Client):
             )
 
         model = get_openrouter_model()
-        fallback_models = get_openrouter_fallback_models()
         try:
             return await asyncio.to_thread(
                 request_openrouter_roast,
                 api_key=api_key,
                 model=model,
-                fallback_models=fallback_models,
                 member_name=member.display_name,
                 history_messages=history_snapshot.messages,
             )
@@ -1383,7 +1434,7 @@ async def roast(interaction: discord.Interaction) -> None:
 
     LOGGER.info(
         "Collected roast history: guild=%s channel=%s member=%s scanned_messages=%s "
-        "author_messages_seen=%s kept_messages=%s prompt_chars=%s model=%s fallback_models=%s",
+        "author_messages_seen=%s kept_messages=%s prompt_chars=%s model=%s",
         interaction.guild.id,
         interaction.channel.id,
         member.id,
@@ -1392,11 +1443,23 @@ async def roast(interaction: discord.Interaction) -> None:
         history_snapshot.kept_messages,
         history_snapshot.total_chars,
         get_openrouter_model(),
-        get_openrouter_fallback_models(),
+    )
+
+    client.last_roast_debug = RoastDebugSnapshot(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        guild_id=interaction.guild.id,
+        channel_id=interaction.channel.id,
+        member_id=member.id,
+        requested_model=get_openrouter_model(),
+        scanned_messages=history_snapshot.scanned_messages,
+        author_messages_seen=history_snapshot.author_messages_seen,
+        kept_messages=history_snapshot.kept_messages,
+        prompt_chars=history_snapshot.total_chars,
     )
 
     if not history_snapshot.messages:
         if history_snapshot.author_messages_seen > 0:
+            client.last_roast_debug.error_message = "No usable message text was found."
             await interaction.followup.send(
                 "I found your recent posts, but I couldn't read any usable message text. "
                 "Make sure Message Content Intent is enabled and try again.",
@@ -1404,6 +1467,7 @@ async def roast(interaction: discord.Interaction) -> None:
             )
             return
 
+        client.last_roast_debug.error_message = "No recent messages were found."
         await interaction.followup.send(
             "I couldn't find any recent messages from you in this channel to roast.",
             ephemeral=True,
@@ -1413,18 +1477,27 @@ async def roast(interaction: discord.Interaction) -> None:
     try:
         roast_result = await client.generate_roast(member, history_snapshot)
     except RoastGenerationError as exc:
+        if client.last_roast_debug is not None:
+            client.last_roast_debug.status_code = exc.status_code
+            client.last_roast_debug.error_message = exc.user_message
+            client.last_roast_debug.provider_detail = exc.provider_detail
         LOGGER.warning(
             "OpenRouter roast request failed: guild=%s channel=%s member=%s model=%s "
-            "status_code=%s message=%s",
+            "status_code=%s message=%s provider_detail=%s",
             interaction.guild.id,
             interaction.channel.id,
             member.id,
             get_openrouter_model(),
             exc.status_code,
             exc.user_message,
+            exc.provider_detail,
         )
         await interaction.followup.send(exc.user_message, ephemeral=True)
         return
+
+    if client.last_roast_debug is not None:
+        client.last_roast_debug.status_code = 200
+        client.last_roast_debug.resolved_model = roast_result.resolved_model
 
     LOGGER.info(
         "OpenRouter roast request succeeded: guild=%s channel=%s member=%s requested_model=%s "
@@ -1458,6 +1531,61 @@ async def roast(interaction: discord.Interaction) -> None:
             "I generated the roast, but I couldn't post it in this channel.",
             ephemeral=True,
         )
+
+
+@app_commands.command(
+    name="test",
+    description="Show the latest roast debug info for this bot instance.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def test(interaction: discord.Interaction) -> None:
+    client = interaction.client
+    if not isinstance(client, ColorRoleBot):
+        await interaction.response.send_message(
+            "Bot is not configured correctly.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Admins only.",
+            ephemeral=True,
+        )
+        return
+
+    debug_snapshot = client.last_roast_debug
+    if debug_snapshot is None:
+        await interaction.response.send_message(
+            "No roast debug info has been recorded yet on this bot instance.",
+            ephemeral=True,
+        )
+        return
+
+    debug_lines = [
+        f"build: {BUILD_ID}",
+        f"timestamp: {debug_snapshot.timestamp}",
+        f"guild_id: {debug_snapshot.guild_id}",
+        f"channel_id: {debug_snapshot.channel_id}",
+        f"member_id: {debug_snapshot.member_id}",
+        f"requested_model: {debug_snapshot.requested_model}",
+        f"resolved_model: {debug_snapshot.resolved_model or 'none'}",
+        f"status_code: {debug_snapshot.status_code if debug_snapshot.status_code is not None else 'none'}",
+        f"scanned_messages: {debug_snapshot.scanned_messages}",
+        f"author_messages_seen: {debug_snapshot.author_messages_seen}",
+        f"kept_messages: {debug_snapshot.kept_messages}",
+        f"prompt_chars: {debug_snapshot.prompt_chars}",
+        f"message_content_intent: {client.intents.message_content}",
+        f"api_key_present: {bool(get_openrouter_api_key())}",
+        f"error_message: {debug_snapshot.error_message or 'none'}",
+        f"provider_detail: {debug_snapshot.provider_detail or 'none'}",
+    ]
+    await interaction.response.send_message(
+        "```text\n" + "\n".join(debug_lines) + "\n```",
+        ephemeral=True,
+    )
 
 
 def main() -> None:

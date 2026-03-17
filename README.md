@@ -28,15 +28,15 @@ Discord bot that turns emoji reactions into shared name-color roles and can roas
 - Run `/here` once per server in the channel that should host the picker message.
 - Users react to that message with a standard Unicode emoji to get a shared `color-{emoji}` role.
 - Run `/roast` in any server text channel or thread to roast yourself based on your recent messages in that channel.
+- Run `/test` as a server admin to see the latest in-memory roast debug snapshot for that bot instance.
 
 ## Notes
 
 - Picker message locations are persisted per server in `state.json`.
 - `STATE_FILE_PATH` can point at a persistent location, which is useful for hosted deployments.
-- `OPENROUTER_MODEL` is optional and defaults to `venice/uncensored:free`.
-- `OPENROUTER_FALLBACK_MODELS` is optional and defaults to `openrouter/free` so `/roast` can try another OpenRouter route when the primary model is rate-limited or unavailable.
+- `OPENROUTER_MODEL` is optional and defaults to `cognitivecomputations/dolphin-mistral-24b-venice-edition`.
 - Global slash command sync can take a little time to appear in Discord.
 - Custom server emojis are ignored because the bot derives colors from Twemoji PNG assets.
 - Color roles are moved as high as the bot can manage, directly under the bot's highest role. If another role still overrides the name color, move the bot's role higher in Discord's role list.
 - `/roast` only uses the invoking user's recent messages from the current channel and does not store roast history.
-- For Railway deployments, set `DISCORD_BOT_TOKEN`, `OPENROUTER_API_KEY`, and optionally `OPENROUTER_MODEL` / `OPENROUTER_FALLBACK_MODELS` in service variables. Enable both `Server Members Intent` and `Message Content Intent` in the Discord developer portal.
+- For Railway deployments, set `DISCORD_BOT_TOKEN`, `OPENROUTER_API_KEY`, and optionally `OPENROUTER_MODEL` in service variables. Enable both `Server Members Intent` and `Message Content Intent` in the Discord developer portal.
