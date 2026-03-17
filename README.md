@@ -41,4 +41,5 @@ Discord bot that turns emoji reactions into shared name-color roles and can roas
 - Custom server emojis are ignored because the bot derives colors from Twemoji PNG assets.
 - Color roles are moved as high as the bot can manage, directly under the bot's highest role. If another role still overrides the name color, move the bot's role higher in Discord's role list.
 - `/roast` only uses the invoking user's recent messages from the current channel and does not store roast history.
+- `/roast` can use text, GIF-only posts, stickers, attachments, and embeds as roast context. If you have no recent channel history, it falls back to roasting you for lurking instead of erroring.
 - For Railway deployments, set `DISCORD_BOT_TOKEN`, `OPENROUTER_API_KEY`, and optionally `OPENROUTER_MODEL` / `COMMAND_GUILD_ID` in service variables. Enable both `Server Members Intent` and `Message Content Intent` in the Discord developer portal.

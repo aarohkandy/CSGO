@@ -35,6 +35,7 @@ ROAST_HISTORY_CHAR_LIMIT = 6000
 ROAST_MAX_TOKENS = 220
 ROAST_REQUEST_TIMEOUT_SECONDS = 30
 URL_PATTERN = re.compile(r"https?://\S+")
+GIF_HOST_PATTERN = re.compile(r"(tenor|giphy)", re.IGNORECASE)
 
 
 logging.basicConfig(
@@ -171,6 +172,7 @@ class RoastHistorySnapshot:
     messages: list[str]
     scanned_messages: int
     author_messages_seen: int
+    used_fallback_context: bool = False
 
     @property
     def kept_messages(self) -> int:
@@ -212,6 +214,7 @@ class RoastDebugSnapshot:
     author_messages_seen: int
     kept_messages: int
     prompt_chars: int
+    used_fallback_context: bool = False
     status_code: Optional[int] = None
     resolved_model: Optional[str] = None
     error_message: Optional[str] = None
@@ -273,6 +276,114 @@ def normalize_roast_message(content: str) -> str:
         normalized = normalized[: ROAST_MESSAGE_CHAR_LIMIT - 3].rstrip() + "..."
 
     return normalized
+
+
+def truncate_roast_fragment(content: str) -> str:
+    if len(content) <= ROAST_MESSAGE_CHAR_LIMIT:
+        return content
+
+    return content[: ROAST_MESSAGE_CHAR_LIMIT - 3].rstrip() + "..."
+
+
+def describe_attachment_for_roast(attachment: discord.Attachment) -> str:
+    content_type = (attachment.content_type or "").lower()
+    filename = attachment.filename or "unknown file"
+    lowered_filename = filename.lower()
+
+    if "gif" in content_type or lowered_filename.endswith(".gif"):
+        return f"sent a GIF attachment ({filename})"
+    if content_type.startswith("image/"):
+        return f"sent an image attachment ({filename})"
+    if content_type.startswith("video/"):
+        return f"sent a video attachment ({filename})"
+
+    return f"uploaded a file ({filename})"
+
+
+def describe_embed_for_roast(embed: discord.Embed) -> Optional[str]:
+    embed_type = (embed.type or "").lower()
+    provider_name = None
+    if embed.provider is not None and embed.provider.name:
+        provider_name = embed.provider.name
+
+    url = ""
+    if isinstance(embed.url, str):
+        url = embed.url
+
+    title = normalize_roast_message(embed.title) if embed.title else ""
+    description = normalize_roast_message(embed.description) if embed.description else ""
+    label_parts = [part for part in (title, description) if part]
+    label = " - ".join(label_parts)
+
+    if embed_type in {"gifv", "video"} or url.lower().endswith(".gif") or GIF_HOST_PATTERN.search(url):
+        descriptor = "posted a GIF embed"
+    elif embed_type == "image":
+        descriptor = "posted an image embed"
+    elif embed_type in {"article", "link", "rich"}:
+        descriptor = "posted an embed"
+    else:
+        descriptor = f"posted a {embed_type} embed" if embed_type else "posted an embed"
+
+    if provider_name:
+        descriptor += f" from {provider_name}"
+
+    if label:
+        descriptor += f": {label}"
+
+    normalized_descriptor = " ".join(descriptor.split()).strip()
+    if not normalized_descriptor:
+        return None
+
+    return truncate_roast_fragment(normalized_descriptor)
+
+
+def summarize_message_for_roast(message: discord.Message) -> Optional[str]:
+    fragments: list[str] = []
+
+    normalized_content = normalize_roast_message(message.clean_content)
+    if normalized_content:
+        fragments.append(normalized_content)
+
+    for sticker in message.stickers:
+        sticker_name = normalize_roast_message(sticker.name) if sticker.name else ""
+        if sticker_name:
+            fragments.append(f"used a sticker: {sticker_name}")
+        else:
+            fragments.append("used a sticker with no text")
+
+    for attachment in message.attachments:
+        fragments.append(describe_attachment_for_roast(attachment))
+
+    for embed in message.embeds:
+        embed_description = describe_embed_for_roast(embed)
+        if embed_description:
+            fragments.append(embed_description)
+
+    if not fragments:
+        return None
+
+    combined = " | ".join(fragment for fragment in fragments if fragment)
+    combined = " ".join(combined.split()).strip()
+    if not combined:
+        return None
+
+    return truncate_roast_fragment(combined)
+
+
+def fallback_roast_context(author_messages_seen: int) -> str:
+    if author_messages_seen > 0:
+        return (
+            "No readable text survived from this user's recent posts, so they mostly "
+            "came off like someone hiding behind silent GIFs, stickers, embeds, or "
+            "empty drive-by messages. Roast them for wanting attention while being too "
+            "scared to actually talk."
+        )
+
+    return (
+        "This user asked for a roast without leaving any recent messages in the "
+        "channel. Roast them for lurking, showing up empty-handed, and being too "
+        "scared to talk until they wanted attention."
+    )
 
 
 def roast_history_char_count(messages: list[str]) -> int:
@@ -378,13 +489,17 @@ def request_openrouter_roast(
         "obsessions, awkward wording, and embarrassing priorities that show up in the "
         "messages. Do not soften the jokes, do not give advice, do not compliment them, "
         "do not add a preamble, do not mention being an AI, do not use bullet points, "
-        "and do not invent facts not grounded in the messages. Avoid just listing bio "
-        "facts unless the supplied messages themselves make those facts embarrassing."
+        "and do not invent facts not grounded in the messages. If the supplied context "
+        "shows silence, lurking, or wordless GIF posting, roast them hard for being too "
+        "scared to talk. Avoid just listing bio facts unless the supplied messages "
+        "themselves make those facts embarrassing."
     )
     user_prompt = (
-        f"Roast {member_name} based only on these recent Discord messages from the "
-        "current channel. Keep it as one paragraph. Make it cutting and funny, not "
-        "generic, and do not sound supportive or polite.\n\n"
+        f"Roast {member_name} based only on these recent Discord message notes from "
+        "the current channel. The notes can include text, GIF behavior, stickers, "
+        "attachments, embeds, or explicit silence context. Keep it as one paragraph. "
+        "Make it cutting and funny, not generic, and do not sound supportive or "
+        "polite.\n\n"
         f"{format_roast_history(history_messages)}"
     )
     payload = {
@@ -1190,6 +1305,7 @@ class ColorRoleBot(discord.Client):
         scanned_messages = 0
         author_messages_seen = 0
         collected_messages: list[str] = []
+        used_fallback_context = False
 
         async for message in channel.history(
             limit=ROAST_HISTORY_SCAN_LIMIT,
@@ -1200,19 +1316,24 @@ class ColorRoleBot(discord.Client):
                 continue
 
             author_messages_seen += 1
-            normalized = normalize_roast_message(message.clean_content)
-            if not normalized:
+            summarized_message = summarize_message_for_roast(message)
+            if not summarized_message:
                 continue
 
-            collected_messages.append(normalized)
+            collected_messages.append(summarized_message)
             if len(collected_messages) >= ROAST_HISTORY_MESSAGE_LIMIT:
                 break
+
+        if not collected_messages:
+            collected_messages = [fallback_roast_context(author_messages_seen)]
+            used_fallback_context = True
 
         collected_messages.reverse()
         return RoastHistorySnapshot(
             messages=trim_roast_history(collected_messages),
             scanned_messages=scanned_messages,
             author_messages_seen=author_messages_seen,
+            used_fallback_context=used_fallback_context,
         )
 
     async def generate_roast(
@@ -1453,7 +1574,8 @@ async def roast(interaction: discord.Interaction) -> None:
 
     LOGGER.info(
         "Collected roast history: guild=%s channel=%s member=%s scanned_messages=%s "
-        "author_messages_seen=%s kept_messages=%s prompt_chars=%s model=%s",
+        "author_messages_seen=%s kept_messages=%s prompt_chars=%s used_fallback=%s "
+        "model=%s",
         interaction.guild.id,
         interaction.channel.id,
         member.id,
@@ -1461,6 +1583,7 @@ async def roast(interaction: discord.Interaction) -> None:
         history_snapshot.author_messages_seen,
         history_snapshot.kept_messages,
         history_snapshot.total_chars,
+        history_snapshot.used_fallback_context,
         get_openrouter_model(),
     )
 
@@ -1474,24 +1597,8 @@ async def roast(interaction: discord.Interaction) -> None:
         author_messages_seen=history_snapshot.author_messages_seen,
         kept_messages=history_snapshot.kept_messages,
         prompt_chars=history_snapshot.total_chars,
+        used_fallback_context=history_snapshot.used_fallback_context,
     )
-
-    if not history_snapshot.messages:
-        if history_snapshot.author_messages_seen > 0:
-            client.last_roast_debug.error_message = "No usable message text was found."
-            await interaction.followup.send(
-                "I found your recent posts, but I couldn't read any usable message text. "
-                "Make sure Message Content Intent is enabled and try again.",
-                ephemeral=True,
-            )
-            return
-
-        client.last_roast_debug.error_message = "No recent messages were found."
-        await interaction.followup.send(
-            "I couldn't find any recent messages from you in this channel to roast.",
-            ephemeral=True,
-        )
-        return
 
     try:
         roast_result = await client.generate_roast(member, history_snapshot)
@@ -1597,6 +1704,7 @@ async def test(interaction: discord.Interaction) -> None:
         f"author_messages_seen: {debug_snapshot.author_messages_seen}",
         f"kept_messages: {debug_snapshot.kept_messages}",
         f"prompt_chars: {debug_snapshot.prompt_chars}",
+        f"used_fallback_context: {debug_snapshot.used_fallback_context}",
         f"message_content_intent: {client.intents.message_content}",
         f"api_key_present: {bool(get_openrouter_api_key())}",
         f"error_message: {debug_snapshot.error_message or 'none'}",
