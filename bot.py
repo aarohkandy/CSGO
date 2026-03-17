@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -28,6 +28,14 @@ TWEMOJI_BASE_URL = (
 )
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_OPENROUTER_MODEL = "venice/uncensored:free"
+# Ranked by how explicitly the current OpenRouter model pages emphasize uncensored,
+# stripped-alignment, or NSFW-friendly creative behavior while still being usable.
+DEFAULT_OPENROUTER_FALLBACK_MODELS = [
+    "cognitivecomputations/dolphin-llama-3-70b:free",
+    "neversleep/llama-3.1-lumimaid-70b:free",
+    "nothingiisreal/mn-celeste-12b:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+]
 ROAST_HISTORY_SCAN_LIMIT = 400
 ROAST_HISTORY_MESSAGE_LIMIT = 25
 ROAST_MESSAGE_CHAR_LIMIT = 300
@@ -190,17 +198,20 @@ class RoastGenerationError(Exception):
         *,
         status_code: Optional[int] = None,
         provider_detail: Optional[str] = None,
+        attempted_models: Optional[list[str]] = None,
     ) -> None:
         super().__init__(user_message)
         self.user_message = user_message
         self.status_code = status_code
         self.provider_detail = provider_detail
+        self.attempted_models = attempted_models or []
 
 
 @dataclass
 class RoastGenerationResult:
     text: str
     resolved_model: Optional[str] = None
+    attempted_models: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -215,6 +226,7 @@ class RoastDebugSnapshot:
     kept_messages: int
     prompt_chars: int
     used_fallback_context: bool = False
+    attempted_models: list[str] = field(default_factory=list)
     status_code: Optional[int] = None
     resolved_model: Optional[str] = None
     error_message: Optional[str] = None
@@ -237,6 +249,19 @@ def get_openrouter_model() -> str:
 
     model = model.strip()
     return model or DEFAULT_OPENROUTER_MODEL
+
+
+def get_openrouter_model_chain() -> list[str]:
+    primary_model = get_openrouter_model()
+    model_chain: list[str] = []
+
+    for model in [primary_model, *DEFAULT_OPENROUTER_FALLBACK_MODELS]:
+        normalized_model = model.strip()
+        if not normalized_model or normalized_model in model_chain:
+            continue
+        model_chain.append(normalized_model)
+
+    return model_chain
 
 
 def get_command_guild_id() -> Optional[int]:
@@ -582,6 +607,13 @@ def request_openrouter_roast(
         resolved_model = None
 
     return RoastGenerationResult(text=roast_text, resolved_model=resolved_model)
+
+
+def should_retry_roast_model(error: RoastGenerationError) -> bool:
+    if error.status_code == 401:
+        return False
+
+    return True
 
 
 def dominant_color_for_emoji(emoji: str) -> tuple[int, int, int]:
@@ -1347,21 +1379,63 @@ class ColorRoleBot(discord.Client):
                 "OPENROUTER_API_KEY is missing from the environment."
             )
 
-        model = get_openrouter_model()
-        try:
-            return await asyncio.to_thread(
-                request_openrouter_roast,
-                api_key=api_key,
-                model=model,
-                member_name=member.display_name,
-                history_messages=history_snapshot.messages,
-            )
-        except RoastGenerationError:
-            raise
-        except Exception as exc:
+        attempted_models: list[str] = []
+        last_error: Optional[RoastGenerationError] = None
+
+        for model in get_openrouter_model_chain():
+            try:
+                roast_result = await asyncio.to_thread(
+                    request_openrouter_roast,
+                    api_key=api_key,
+                    model=model,
+                    member_name=member.display_name,
+                    history_messages=history_snapshot.messages,
+                )
+                roast_result.attempted_models = [*attempted_models, f"{model}: ok"]
+                return roast_result
+            except RoastGenerationError as exc:
+                last_error = exc
+                status_label = exc.status_code if exc.status_code is not None else "network"
+                detail_label = exc.provider_detail or exc.user_message
+                attempted_models.append(f"{model}: {status_label} ({detail_label})")
+                LOGGER.warning(
+                    "Roast model attempt failed for member=%s model=%s status=%s detail=%s",
+                    member.id,
+                    model,
+                    exc.status_code,
+                    exc.provider_detail or exc.user_message,
+                )
+                if not should_retry_roast_model(exc):
+                    raise RoastGenerationError(
+                        exc.user_message,
+                        status_code=exc.status_code,
+                        provider_detail=exc.provider_detail,
+                        attempted_models=attempted_models,
+                    ) from exc
+            except Exception as exc:
+                last_error = RoastGenerationError(
+                    "The roast model failed unexpectedly.",
+                    attempted_models=[*attempted_models, f"{model}: unexpected error"],
+                )
+                attempted_models = last_error.attempted_models
+                LOGGER.exception(
+                    "Unexpected roast model failure for member=%s model=%s.",
+                    member.id,
+                    model,
+                )
+
+        if last_error is None:
             raise RoastGenerationError(
-                "The roast model failed unexpectedly."
-            ) from exc
+                "The roast model failed unexpectedly.",
+                attempted_models=attempted_models,
+            )
+
+        raise RoastGenerationError(
+            last_error.user_message,
+            status_code=last_error.status_code,
+            provider_detail=last_error.provider_detail,
+            attempted_models=attempted_models or last_error.attempted_models,
+        ) from last_error
 
 
 def can_send_in_channel(
@@ -1575,7 +1649,7 @@ async def roast(interaction: discord.Interaction) -> None:
     LOGGER.info(
         "Collected roast history: guild=%s channel=%s member=%s scanned_messages=%s "
         "author_messages_seen=%s kept_messages=%s prompt_chars=%s used_fallback=%s "
-        "model=%s",
+        "model_chain=%s",
         interaction.guild.id,
         interaction.channel.id,
         member.id,
@@ -1584,7 +1658,7 @@ async def roast(interaction: discord.Interaction) -> None:
         history_snapshot.kept_messages,
         history_snapshot.total_chars,
         history_snapshot.used_fallback_context,
-        get_openrouter_model(),
+        " -> ".join(get_openrouter_model_chain()),
     )
 
     client.last_roast_debug = RoastDebugSnapshot(
@@ -1607,9 +1681,10 @@ async def roast(interaction: discord.Interaction) -> None:
             client.last_roast_debug.status_code = exc.status_code
             client.last_roast_debug.error_message = exc.user_message
             client.last_roast_debug.provider_detail = exc.provider_detail
+            client.last_roast_debug.attempted_models = list(exc.attempted_models)
         LOGGER.warning(
             "OpenRouter roast request failed: guild=%s channel=%s member=%s model=%s "
-            "status_code=%s message=%s provider_detail=%s",
+            "status_code=%s message=%s provider_detail=%s attempts=%s",
             interaction.guild.id,
             interaction.channel.id,
             member.id,
@@ -1617,6 +1692,7 @@ async def roast(interaction: discord.Interaction) -> None:
             exc.status_code,
             exc.user_message,
             exc.provider_detail,
+            " | ".join(exc.attempted_models) if exc.attempted_models else "none",
         )
         await interaction.followup.send(exc.user_message, ephemeral=True)
         return
@@ -1624,15 +1700,17 @@ async def roast(interaction: discord.Interaction) -> None:
     if client.last_roast_debug is not None:
         client.last_roast_debug.status_code = 200
         client.last_roast_debug.resolved_model = roast_result.resolved_model
+        client.last_roast_debug.attempted_models = list(roast_result.attempted_models)
 
     LOGGER.info(
         "OpenRouter roast request succeeded: guild=%s channel=%s member=%s requested_model=%s "
-        "resolved_model=%s",
+        "resolved_model=%s attempts=%s",
         interaction.guild.id,
         interaction.channel.id,
         member.id,
         get_openrouter_model(),
         roast_result.resolved_model or "unknown",
+        " | ".join(roast_result.attempted_models) if roast_result.attempted_models else "none",
     )
 
     escaped_roast_text = discord.utils.escape_mentions(roast_result.text)
@@ -1707,6 +1785,7 @@ async def test(interaction: discord.Interaction) -> None:
         f"used_fallback_context: {debug_snapshot.used_fallback_context}",
         f"message_content_intent: {client.intents.message_content}",
         f"api_key_present: {bool(get_openrouter_api_key())}",
+        f"attempted_models: {' | '.join(debug_snapshot.attempted_models) if debug_snapshot.attempted_models else 'none'}",
         f"error_message: {debug_snapshot.error_message or 'none'}",
         f"provider_detail: {debug_snapshot.provider_detail or 'none'}",
     ]
