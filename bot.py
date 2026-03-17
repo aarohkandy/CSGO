@@ -33,8 +33,6 @@ DEFAULT_OPENROUTER_MODEL = "venice/uncensored:free"
 DEFAULT_OPENROUTER_FALLBACK_MODELS = [
     "nousresearch/hermes-3-llama-3.1-405b:free",
     "openrouter/free",
-    "mistralai/mistral-small-3.2-24b-instruct:free",
-    "meta-llama/llama-3.3-8b-instruct:free",
 ]
 ROAST_HISTORY_SCAN_LIMIT = 400
 ROAST_HISTORY_MESSAGE_LIMIT = 25
@@ -614,6 +612,60 @@ def should_retry_roast_model(error: RoastGenerationError) -> bool:
         return False
 
     return True
+
+
+def summarize_roast_failure(
+    errors: list[RoastGenerationError],
+    attempted_models: list[str],
+) -> RoastGenerationError:
+    if not errors:
+        return RoastGenerationError(
+            "The roast model failed unexpectedly.",
+            attempted_models=attempted_models,
+        )
+
+    status_codes = [error.status_code for error in errors]
+    provider_details = [error.provider_detail for error in errors if error.provider_detail]
+    provider_detail = " | ".join(provider_details) if provider_details else errors[-1].provider_detail
+
+    if 401 in status_codes:
+        return RoastGenerationError(
+            "The roast model API key is invalid or missing.",
+            status_code=401,
+            provider_detail=provider_detail,
+            attempted_models=attempted_models,
+        )
+
+    if any(status_code == 429 for status_code in status_codes):
+        return RoastGenerationError(
+            "The roast model fallbacks are rate-limited or temporarily overloaded right now. Try again in a bit.",
+            status_code=429,
+            provider_detail=provider_detail,
+            attempted_models=attempted_models,
+        )
+
+    if status_codes and all(status_code == 404 for status_code in status_codes if status_code is not None):
+        return RoastGenerationError(
+            "All configured roast model fallbacks are unavailable on OpenRouter right now.",
+            status_code=404,
+            provider_detail=provider_detail,
+            attempted_models=attempted_models,
+        )
+
+    if any(status_code is None or status_code >= 500 for status_code in status_codes):
+        return RoastGenerationError(
+            "Every roast model fallback failed right now. Try again in a bit.",
+            status_code=errors[-1].status_code,
+            provider_detail=provider_detail,
+            attempted_models=attempted_models,
+        )
+
+    return RoastGenerationError(
+        errors[-1].user_message,
+        status_code=errors[-1].status_code,
+        provider_detail=provider_detail,
+        attempted_models=attempted_models,
+    )
 
 
 def dominant_color_for_emoji(emoji: str) -> tuple[int, int, int]:
@@ -1380,7 +1432,7 @@ class ColorRoleBot(discord.Client):
             )
 
         attempted_models: list[str] = []
-        last_error: Optional[RoastGenerationError] = None
+        attempt_errors: list[RoastGenerationError] = []
 
         for model in get_openrouter_model_chain():
             try:
@@ -1394,7 +1446,7 @@ class ColorRoleBot(discord.Client):
                 roast_result.attempted_models = [*attempted_models, f"{model}: ok"]
                 return roast_result
             except RoastGenerationError as exc:
-                last_error = exc
+                attempt_errors.append(exc)
                 status_label = exc.status_code if exc.status_code is not None else "network"
                 detail_label = exc.provider_detail or exc.user_message
                 attempted_models.append(f"{model}: {status_label} ({detail_label})")
@@ -1406,36 +1458,21 @@ class ColorRoleBot(discord.Client):
                     exc.provider_detail or exc.user_message,
                 )
                 if not should_retry_roast_model(exc):
-                    raise RoastGenerationError(
-                        exc.user_message,
-                        status_code=exc.status_code,
-                        provider_detail=exc.provider_detail,
-                        attempted_models=attempted_models,
-                    ) from exc
+                    raise summarize_roast_failure(attempt_errors, attempted_models) from exc
             except Exception as exc:
-                last_error = RoastGenerationError(
+                generated_error = RoastGenerationError(
                     "The roast model failed unexpectedly.",
                     attempted_models=[*attempted_models, f"{model}: unexpected error"],
                 )
-                attempted_models = last_error.attempted_models
+                attempt_errors.append(generated_error)
+                attempted_models = generated_error.attempted_models
                 LOGGER.exception(
                     "Unexpected roast model failure for member=%s model=%s.",
                     member.id,
                     model,
                 )
 
-        if last_error is None:
-            raise RoastGenerationError(
-                "The roast model failed unexpectedly.",
-                attempted_models=attempted_models,
-            )
-
-        raise RoastGenerationError(
-            last_error.user_message,
-            status_code=last_error.status_code,
-            provider_detail=last_error.provider_detail,
-            attempted_models=attempted_models or last_error.attempted_models,
-        ) from last_error
+        raise summarize_roast_failure(attempt_errors, attempted_models)
 
 
 def can_send_in_channel(
