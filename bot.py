@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -24,6 +25,15 @@ BUILD_ID = os.getenv("RENDER_GIT_COMMIT") or os.getenv("RAILWAY_GIT_COMMIT_SHA")
 TWEMOJI_BASE_URL = (
     "https://cdn.jsdelivr.net/gh/twitter/twemoji/assets/72x72/{codepoints}.png"
 )
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_OPENROUTER_MODEL = "venice/uncensored:free"
+ROAST_HISTORY_SCAN_LIMIT = 400
+ROAST_HISTORY_MESSAGE_LIMIT = 25
+ROAST_MESSAGE_CHAR_LIMIT = 300
+ROAST_HISTORY_CHAR_LIMIT = 6000
+ROAST_MAX_TOKENS = 220
+ROAST_REQUEST_TIMEOUT_SECONDS = 30
+URL_PATTERN = re.compile(r"https?://\S+")
 
 
 logging.basicConfig(
@@ -155,6 +165,46 @@ class BotState:
         self.guilds.pop(guild_id, None)
 
 
+@dataclass
+class RoastHistorySnapshot:
+    messages: list[str]
+    scanned_messages: int
+    author_messages_seen: int
+
+    @property
+    def kept_messages(self) -> int:
+        return len(self.messages)
+
+    @property
+    def total_chars(self) -> int:
+        return roast_history_char_count(self.messages)
+
+
+class RoastGenerationError(Exception):
+    def __init__(self, user_message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+        self.status_code = status_code
+
+
+def get_openrouter_api_key() -> Optional[str]:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if api_key is None:
+        return None
+
+    api_key = api_key.strip()
+    return api_key or None
+
+
+def get_openrouter_model() -> str:
+    model = os.getenv("OPENROUTER_MODEL")
+    if model is None:
+        return DEFAULT_OPENROUTER_MODEL
+
+    model = model.strip()
+    return model or DEFAULT_OPENROUTER_MODEL
+
+
 def color_role_name(emoji: str) -> str:
     return f"{COLOR_ROLE_PREFIX}{emoji}"
 
@@ -179,6 +229,160 @@ def emoji_to_codepoints(emoji: str) -> str:
 
 def twemoji_url_for_emoji(emoji: str) -> str:
     return TWEMOJI_BASE_URL.format(codepoints=emoji_to_codepoints(emoji))
+
+
+def normalize_roast_message(content: str) -> str:
+    normalized = URL_PATTERN.sub("", content)
+    normalized = " ".join(normalized.split())
+    if len(normalized) > ROAST_MESSAGE_CHAR_LIMIT:
+        normalized = normalized[: ROAST_MESSAGE_CHAR_LIMIT - 3].rstrip() + "..."
+
+    return normalized
+
+
+def roast_history_char_count(messages: list[str]) -> int:
+    if not messages:
+        return 0
+
+    numbered_messages = [f"{index + 1}. {message}" for index, message in enumerate(messages)]
+    return sum(len(message) for message in numbered_messages) + (len(numbered_messages) - 1)
+
+
+def trim_roast_history(messages: list[str]) -> list[str]:
+    trimmed_messages = list(messages)
+    while trimmed_messages and roast_history_char_count(trimmed_messages) > ROAST_HISTORY_CHAR_LIMIT:
+        trimmed_messages.pop(0)
+
+    return trimmed_messages
+
+
+def format_roast_history(messages: list[str]) -> str:
+    return "\n".join(f"{index + 1}. {message}" for index, message in enumerate(messages))
+
+
+def extract_roast_text(response_data: Any) -> Optional[str]:
+    if not isinstance(response_data, dict):
+        return None
+
+    choices = response_data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        return None
+
+    content = message.get("content")
+    if isinstance(content, str):
+        normalized = " ".join(content.split())
+        return normalized or None
+
+    if not isinstance(content, list):
+        return None
+
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+
+    if not parts:
+        return None
+
+    normalized = " ".join(" ".join(parts).split())
+    return normalized or None
+
+
+def request_openrouter_roast(
+    *,
+    api_key: str,
+    model: str,
+    member_name: str,
+    history_messages: list[str],
+) -> str:
+    system_prompt = (
+        "You are a brutal but funny Discord roast comic. Write exactly one paragraph "
+        "of 3 to 5 sentences. Make it specific to the supplied messages, hit hard, and "
+        "keep it funny. Do not apologize, do not add a preamble, do not mention being "
+        "an AI, do not use bullet points, and do not invent facts not grounded in the "
+        "messages."
+    )
+    user_prompt = (
+        f"Roast {member_name} based only on these recent Discord messages from the "
+        "current channel. Keep it as one paragraph.\n\n"
+        f"{format_roast_history(history_messages)}"
+    )
+    payload = {
+        "model": model,
+        "temperature": 1.1,
+        "max_tokens": ROAST_MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "ColorSeg",
+    }
+
+    try:
+        response = requests.post(
+            OPENROUTER_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=ROAST_REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise RoastGenerationError(
+            "I couldn't reach the roast model right now. Try again in a bit."
+        ) from exc
+
+    if response.status_code == 401:
+        raise RoastGenerationError(
+            "The roast model API key is invalid or missing.",
+            status_code=response.status_code,
+        )
+    if response.status_code == 429:
+        raise RoastGenerationError(
+            "The roast model is rate-limited right now. Try again in a bit.",
+            status_code=response.status_code,
+        )
+    if response.status_code >= 500:
+        raise RoastGenerationError(
+            "The roast model provider is having issues right now.",
+            status_code=response.status_code,
+        )
+    if response.status_code >= 400:
+        raise RoastGenerationError(
+            "The roast model rejected the request.",
+            status_code=response.status_code,
+        )
+
+    try:
+        response_data = response.json()
+    except ValueError as exc:
+        raise RoastGenerationError(
+            "The roast model returned an unreadable response.",
+            status_code=response.status_code,
+        ) from exc
+
+    roast_text = extract_roast_text(response_data)
+    if roast_text is None:
+        raise RoastGenerationError(
+            "The roast model returned an empty response.",
+            status_code=response.status_code,
+        )
+
+    return roast_text
 
 
 def dominant_color_for_emoji(emoji: str) -> tuple[int, int, int]:
@@ -215,6 +419,7 @@ class ColorRoleBot(discord.Client):
         intents.guilds = True
         intents.guild_reactions = True
         intents.members = True
+        intents.message_content = True
 
         super().__init__(intents=intents)
 
@@ -226,6 +431,7 @@ class ColorRoleBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.tree.add_command(here)
+        self.tree.add_command(roast)
         synced = await self.tree.sync()
         LOGGER.info("Synced %s application command(s).", len(synced))
 
@@ -880,6 +1086,76 @@ class ColorRoleBot(discord.Client):
             message.id,
         )
 
+    async def collect_roast_history(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+        member: discord.Member,
+    ) -> RoastHistorySnapshot:
+        scanned_messages = 0
+        author_messages_seen = 0
+        collected_messages: list[str] = []
+
+        async for message in channel.history(
+            limit=ROAST_HISTORY_SCAN_LIMIT,
+            oldest_first=False,
+        ):
+            scanned_messages += 1
+            if message.author.id != member.id:
+                continue
+
+            author_messages_seen += 1
+            normalized = normalize_roast_message(message.clean_content)
+            if not normalized:
+                continue
+
+            collected_messages.append(normalized)
+            if len(collected_messages) >= ROAST_HISTORY_MESSAGE_LIMIT:
+                break
+
+        collected_messages.reverse()
+        return RoastHistorySnapshot(
+            messages=trim_roast_history(collected_messages),
+            scanned_messages=scanned_messages,
+            author_messages_seen=author_messages_seen,
+        )
+
+    async def generate_roast(
+        self,
+        member: discord.Member,
+        history_snapshot: RoastHistorySnapshot,
+    ) -> str:
+        api_key = get_openrouter_api_key()
+        if api_key is None:
+            raise RoastGenerationError(
+                "OPENROUTER_API_KEY is missing from the environment."
+            )
+
+        model = get_openrouter_model()
+        try:
+            return await asyncio.to_thread(
+                request_openrouter_roast,
+                api_key=api_key,
+                model=model,
+                member_name=member.display_name,
+                history_messages=history_snapshot.messages,
+            )
+        except RoastGenerationError:
+            raise
+        except Exception as exc:
+            raise RoastGenerationError(
+                "The roast model failed unexpectedly."
+            ) from exc
+
+
+def can_send_in_channel(
+    channel: discord.TextChannel | discord.Thread,
+    permissions: discord.Permissions,
+) -> bool:
+    if isinstance(channel, discord.Thread):
+        return permissions.send_messages_in_threads or permissions.send_messages
+
+    return permissions.send_messages
+
 
 @app_commands.command(
     name="here",
@@ -978,6 +1254,167 @@ async def here(interaction: discord.Interaction) -> None:
     await interaction.followup.send("Color role message created.", ephemeral=True)
 
 
+@app_commands.command(
+    name="roast",
+    description="Roast yourself based on your recent messages in this channel.",
+)
+@app_commands.guild_only()
+async def roast(interaction: discord.Interaction) -> None:
+    client = interaction.client
+    if not isinstance(client, ColorRoleBot):
+        await interaction.response.send_message(
+            "Bot is not configured correctly.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None or not isinstance(
+        interaction.channel, (discord.TextChannel, discord.Thread)
+    ):
+        await interaction.response.send_message(
+            "This command must be used in a server text channel.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "I couldn't resolve your server member information.",
+            ephemeral=True,
+        )
+        return
+
+    guild_member = interaction.guild.me
+    if guild_member is None:
+        await interaction.response.send_message(
+            "I couldn't resolve my server permissions right now.",
+            ephemeral=True,
+        )
+        return
+
+    permissions = interaction.channel.permissions_for(guild_member)
+    if not permissions.view_channel or not permissions.read_message_history:
+        await interaction.response.send_message(
+            "I need View Channel and Read Message History here before I can roast you.",
+            ephemeral=True,
+        )
+        return
+
+    if not can_send_in_channel(interaction.channel, permissions):
+        await interaction.response.send_message(
+            "I need permission to send messages in this channel before I can roast you.",
+            ephemeral=True,
+        )
+        return
+
+    if not client.intents.message_content:
+        await interaction.response.send_message(
+            "Message Content Intent needs to be enabled before I can read your messages.",
+            ephemeral=True,
+        )
+        return
+
+    LOGGER.info(
+        "/roast invoked: guild=%s (%s) channel=%s member=%s (%s) build=%s",
+        interaction.guild.name,
+        interaction.guild.id,
+        interaction.channel.id,
+        member,
+        member.id,
+        BUILD_ID,
+    )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        history_snapshot = await client.collect_roast_history(interaction.channel, member)
+    except discord.Forbidden:
+        LOGGER.exception(
+            "Missing permissions while reading history for /roast in guild %s channel %s.",
+            interaction.guild.id,
+            interaction.channel.id,
+        )
+        await interaction.followup.send(
+            "I couldn't read message history in this channel.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException:
+        LOGGER.exception(
+            "Unable to collect roast history in guild %s channel %s.",
+            interaction.guild.id,
+            interaction.channel.id,
+        )
+        await interaction.followup.send(
+            "I couldn't read enough history from this channel to roast you right now.",
+            ephemeral=True,
+        )
+        return
+
+    LOGGER.info(
+        "Collected roast history: guild=%s channel=%s member=%s scanned_messages=%s "
+        "author_messages_seen=%s kept_messages=%s prompt_chars=%s model=%s",
+        interaction.guild.id,
+        interaction.channel.id,
+        member.id,
+        history_snapshot.scanned_messages,
+        history_snapshot.author_messages_seen,
+        history_snapshot.kept_messages,
+        history_snapshot.total_chars,
+        get_openrouter_model(),
+    )
+
+    if not history_snapshot.messages:
+        if history_snapshot.author_messages_seen > 0:
+            await interaction.followup.send(
+                "I found your recent posts, but I couldn't read any usable message text. "
+                "Make sure Message Content Intent is enabled and try again.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            "I couldn't find any recent messages from you in this channel to roast.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        roast_text = await client.generate_roast(member, history_snapshot)
+    except RoastGenerationError as exc:
+        LOGGER.warning(
+            "OpenRouter roast request failed: guild=%s channel=%s member=%s model=%s "
+            "status_code=%s message=%s",
+            interaction.guild.id,
+            interaction.channel.id,
+            member.id,
+            get_openrouter_model(),
+            exc.status_code,
+            exc.user_message,
+        )
+        await interaction.followup.send(exc.user_message, ephemeral=True)
+        return
+
+    escaped_roast_text = discord.utils.escape_mentions(roast_text)
+    try:
+        await interaction.followup.send(
+            f"{member.mention} {escaped_roast_text}",
+            ephemeral=False,
+        )
+    except discord.HTTPException:
+        LOGGER.exception(
+            "Unable to send public roast message in guild %s channel %s for member %s.",
+            interaction.guild.id,
+            interaction.channel.id,
+            member.id,
+        )
+        await interaction.followup.send(
+            "I generated the roast, but I couldn't post it in this channel.",
+            ephemeral=True,
+        )
+
+
 def main() -> None:
     load_dotenv()
     token = os.getenv("DISCORD_BOT_TOKEN")
@@ -990,12 +1427,13 @@ def main() -> None:
         bot.run(token, log_handler=None)
     except discord.PrivilegedIntentsRequired:
         LOGGER.error(
-            "Discord rejected the connection because Server Members Intent is "
-            "enabled in code but not in the Discord developer portal."
+            "Discord rejected the connection because one or more privileged intents "
+            "enabled in code are not enabled in the Discord developer portal."
         )
         LOGGER.error(
             "Open your application in the Discord developer portal, go to Bot, "
-            "enable Server Members Intent, save, and then redeploy Railway."
+            "enable Server Members Intent and Message Content Intent, save, and then "
+            "redeploy Railway."
         )
         raise
 

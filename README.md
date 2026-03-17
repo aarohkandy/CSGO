@@ -1,6 +1,6 @@
 # ColorSeg
 
-Discord bot that turns emoji reactions into shared name-color roles.
+Discord bot that turns emoji reactions into shared name-color roles and can roast users based on their recent channel history.
 
 ## Setup
 
@@ -11,10 +11,11 @@ Discord bot that turns emoji reactions into shared name-color roles.
    pip install -r requirements.txt
    ```
 
-3. Copy `.env.example` to `.env` and set `DISCORD_BOT_TOKEN`.
+3. Copy `.env.example` to `.env` and set `DISCORD_BOT_TOKEN` and `OPENROUTER_API_KEY`.
 4. Optional: set `STATE_FILE_PATH` if you want `state.json` stored somewhere else.
 5. In the Discord developer portal, enable:
    - `Server Members Intent`
+   - `Message Content Intent`
 6. Run the bot:
 
    ```bash
@@ -23,15 +24,18 @@ Discord bot that turns emoji reactions into shared name-color roles.
 
 ## Usage
 
-- Invite the bot with permissions to manage roles and read message history.
+- Invite the bot with permissions to manage roles, read message history, and send messages.
 - Run `/here` once per server in the channel that should host the picker message.
 - Users react to that message with a standard Unicode emoji to get a shared `color-{emoji}` role.
+- Run `/roast` in any server text channel or thread to roast yourself based on your recent messages in that channel.
 
 ## Notes
 
 - Picker message locations are persisted per server in `state.json`.
 - `STATE_FILE_PATH` can point at a persistent location, which is useful for hosted deployments.
+- `OPENROUTER_MODEL` is optional and defaults to `venice/uncensored:free`.
 - Global slash command sync can take a little time to appear in Discord.
 - Custom server emojis are ignored because the bot derives colors from Twemoji PNG assets.
 - Color roles are moved as high as the bot can manage, directly under the bot's highest role. If another role still overrides the name color, move the bot's role higher in Discord's role list.
-- For Railway deployments, set `DISCORD_BOT_TOKEN` in service variables and enable `Server Members Intent` in the Discord developer portal.
+- `/roast` only uses the invoking user's recent messages from the current channel and does not store roast history.
+- For Railway deployments, set `DISCORD_BOT_TOKEN`, `OPENROUTER_API_KEY`, and optionally `OPENROUTER_MODEL` in service variables. Enable both `Server Members Intent` and `Message Content Intent` in the Discord developer portal.
