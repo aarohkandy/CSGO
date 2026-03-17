@@ -308,15 +308,19 @@ def request_openrouter_roast(
     history_messages: list[str],
 ) -> str:
     system_prompt = (
-        "You are a brutal but funny Discord roast comic. Write exactly one paragraph "
-        "of 3 to 5 sentences. Make it specific to the supplied messages, hit hard, and "
-        "keep it funny. Do not apologize, do not add a preamble, do not mention being "
-        "an AI, do not use bullet points, and do not invent facts not grounded in the "
-        "messages."
+        "You are a savage Discord roast comic. Write exactly one paragraph of 3 to 5 "
+        "sentences. Make it sharp, mocking, and specific to the supplied messages. "
+        "Target the person's habits, contradictions, try-hard energy, repetitive "
+        "obsessions, awkward wording, and embarrassing priorities that show up in the "
+        "messages. Do not soften the jokes, do not give advice, do not compliment them, "
+        "do not add a preamble, do not mention being an AI, do not use bullet points, "
+        "and do not invent facts not grounded in the messages. Avoid just listing bio "
+        "facts unless the supplied messages themselves make those facts embarrassing."
     )
     user_prompt = (
         f"Roast {member_name} based only on these recent Discord messages from the "
-        "current channel. Keep it as one paragraph.\n\n"
+        "current channel. Keep it as one paragraph. Make it cutting and funny, not "
+        "generic, and do not sound supportive or polite.\n\n"
         f"{format_roast_history(history_messages)}"
     )
     payload = {
@@ -1325,7 +1329,10 @@ async def roast(interaction: discord.Interaction) -> None:
         BUILD_ID,
     )
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.send_message(
+        "Cooking up your roast...",
+        ephemeral=True,
+    )
 
     try:
         history_snapshot = await client.collect_roast_history(interaction.channel, member)
@@ -1398,9 +1405,14 @@ async def roast(interaction: discord.Interaction) -> None:
 
     escaped_roast_text = discord.utils.escape_mentions(roast_text)
     try:
-        await interaction.followup.send(
+        await interaction.channel.send(
             f"{member.mention} {escaped_roast_text}",
-            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                roles=False,
+                users=True,
+                replied_user=False,
+            ),
         )
     except discord.HTTPException:
         LOGGER.exception(
