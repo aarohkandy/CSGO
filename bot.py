@@ -27,7 +27,7 @@ TWEMOJI_BASE_URL = (
     "https://cdn.jsdelivr.net/gh/twitter/twemoji/assets/72x72/{codepoints}.png"
 )
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_OPENROUTER_MODEL = "cognitivecomputations/dolphin-mistral-24b-venice-edition"
+DEFAULT_OPENROUTER_MODEL = "venice/uncensored:free"
 ROAST_HISTORY_SCAN_LIMIT = 400
 ROAST_HISTORY_MESSAGE_LIMIT = 25
 ROAST_MESSAGE_CHAR_LIMIT = 300
@@ -236,6 +236,10 @@ def get_openrouter_model() -> str:
     return model or DEFAULT_OPENROUTER_MODEL
 
 
+def get_command_guild_id() -> Optional[int]:
+    return parse_snowflake(os.getenv("COMMAND_GUILD_ID"))
+
+
 def color_role_name(emoji: str) -> str:
     return f"{COLOR_ROLE_PREFIX}{emoji}"
 
@@ -419,7 +423,7 @@ def request_openrouter_roast(
         )
     if response.status_code == 429:
         raise RoastGenerationError(
-            "The roast model is rate-limited right now. Try again in a bit.",
+            "The free roast model is rate-limited right now. Try again in a bit.",
             status_code=response.status_code,
             provider_detail=provider_detail,
         )
@@ -430,8 +434,13 @@ def request_openrouter_roast(
             provider_detail=provider_detail,
         )
     if response.status_code >= 400:
+        user_message = "The roast model rejected the request."
+        if response.status_code == 404:
+            user_message = (
+                "The selected roast model is not available on OpenRouter right now."
+            )
         raise RoastGenerationError(
-            "The roast model rejected the request.",
+            user_message,
             status_code=response.status_code,
             provider_detail=provider_detail,
         )
@@ -509,8 +518,18 @@ class ColorRoleBot(discord.Client):
         self.tree.add_command(here)
         self.tree.add_command(roast)
         self.tree.add_command(test)
+        command_guild_id = get_command_guild_id()
+        if command_guild_id is not None:
+            synced = await self.tree.sync(guild=discord.Object(id=command_guild_id))
+            LOGGER.info(
+                "Synced %s application command(s) to guild %s.",
+                len(synced),
+                command_guild_id,
+            )
+            return
+
         synced = await self.tree.sync()
-        LOGGER.info("Synced %s application command(s).", len(synced))
+        LOGGER.info("Synced %s application command(s) globally.", len(synced))
 
     async def on_ready(self) -> None:
         if self.user is None:
@@ -1567,6 +1586,7 @@ async def test(interaction: discord.Interaction) -> None:
     debug_lines = [
         f"build: {BUILD_ID}",
         f"timestamp: {debug_snapshot.timestamp}",
+        f"command_guild_id: {get_command_guild_id() or 'global'}",
         f"guild_id: {debug_snapshot.guild_id}",
         f"channel_id: {debug_snapshot.channel_id}",
         f"member_id: {debug_snapshot.member_id}",
