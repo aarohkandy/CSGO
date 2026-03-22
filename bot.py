@@ -750,9 +750,15 @@ class ColorRoleBot(discord.Client):
 
         if not self.state.guilds:
             LOGGER.info(
-                "No watched messages configured yet. Using state file %s.",
+                "No watched messages configured yet. Using state file %s. "
+                "Attempting automatic picker discovery across visible guilds.",
                 self.state_path,
             )
+            await self.discover_picker_messages_on_startup(list(self.guilds))
+            if not self.state.guilds:
+                LOGGER.info(
+                    "Startup picker discovery did not find any recoverable picker messages."
+                )
             return
 
         stale_guild_ids: list[int] = []
@@ -771,9 +777,18 @@ class ColorRoleBot(discord.Client):
                 len(stale_guild_ids),
             )
 
+            stale_guilds = [guild for guild in self.guilds if guild.id in stale_guild_ids]
+            if stale_guilds:
+                LOGGER.info(
+                    "Attempting automatic picker rediscovery for %s guild(s) with stale state.",
+                    len(stale_guilds),
+                )
+                await self.discover_picker_messages_on_startup(stale_guilds)
+
         if not self.state.guilds:
             LOGGER.info(
-                "No watched messages remain configured after startup validation."
+                "No watched messages remain configured after startup validation. "
+                "If the old picker message still exists in Discord, startup discovery and future reactions can recover it automatically.",
             )
 
     async def on_raw_reaction_add(
@@ -782,19 +797,36 @@ class ColorRoleBot(discord.Client):
         if self.user is not None and payload.user_id == self.user.id:
             return
 
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            LOGGER.warning("Guild %s is not available in cache.", payload.guild_id)
+            return
+
         guild_watch_state = self.get_guild_watch_state(payload.guild_id)
         if guild_watch_state is None or not guild_watch_state.matches(
             payload.channel_id, payload.message_id
         ):
-            return
+            state_status = "missing" if guild_watch_state is None else (
+                f"stale channel={guild_watch_state.channel_id} message={guild_watch_state.message_id}"
+            )
+            LOGGER.info(
+                "Picker state miss for guild=%s message=%s (%s); checking for recovery.",
+                payload.guild_id,
+                payload.message_id,
+                state_status,
+            )
+            guild_watch_state = await self.recover_guild_watch_state_from_message(
+                guild,
+                payload.channel_id,
+                payload.message_id,
+            )
+            if guild_watch_state is None or not guild_watch_state.matches(
+                payload.channel_id, payload.message_id
+            ):
+                return
 
         if payload.emoji.id is not None:
             LOGGER.info("Ignoring custom emoji reaction for watched message.")
-            return
-
-        guild = self.get_guild(payload.guild_id)
-        if guild is None:
-            LOGGER.warning("Guild %s is not available in cache.", payload.guild_id)
             return
 
         member = payload.member or guild.get_member(payload.user_id)
@@ -981,11 +1013,33 @@ class ColorRoleBot(discord.Client):
         if self.user is not None and payload.user_id == self.user.id:
             return
 
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            LOGGER.warning("Guild %s is not available in cache.", payload.guild_id)
+            return
+
         guild_watch_state = self.get_guild_watch_state(payload.guild_id)
         if guild_watch_state is None or not guild_watch_state.matches(
             payload.channel_id, payload.message_id
         ):
-            return
+            state_status = "missing" if guild_watch_state is None else (
+                f"stale channel={guild_watch_state.channel_id} message={guild_watch_state.message_id}"
+            )
+            LOGGER.info(
+                "Picker state miss for guild=%s message=%s (%s); checking for recovery.",
+                payload.guild_id,
+                payload.message_id,
+                state_status,
+            )
+            guild_watch_state = await self.recover_guild_watch_state_from_message(
+                guild,
+                payload.channel_id,
+                payload.message_id,
+            )
+            if guild_watch_state is None or not guild_watch_state.matches(
+                payload.channel_id, payload.message_id
+            ):
+                return
 
         if payload.emoji.id is not None:
             return
@@ -997,11 +1051,6 @@ class ColorRoleBot(discord.Client):
         ignored_key = (payload.message_id, payload.user_id, emoji)
         if ignored_key in self._ignored_reaction_removals:
             self._ignored_reaction_removals.discard(ignored_key)
-            return
-
-        guild = self.get_guild(payload.guild_id)
-        if guild is None:
-            LOGGER.warning("Guild %s is not available in cache.", payload.guild_id)
             return
 
         member = guild.get_member(payload.user_id)
@@ -1072,6 +1121,259 @@ class ColorRoleBot(discord.Client):
             return None
 
         return self.state.get_guild_state(guild_id)
+
+    async def find_picker_message_in_channel(
+        self,
+        channel: discord.TextChannel | discord.Thread,
+    ) -> Optional[discord.Message]:
+        candidate_messages: list[discord.Message] = []
+
+        try:
+            async for message in channel.history(limit=None, oldest_first=False):
+                if self.user is None or message.author.id != self.user.id:
+                    continue
+
+                if message.content.strip() != WATCH_MESSAGE_TEXT:
+                    continue
+
+                candidate_messages.append(message)
+        except discord.Forbidden:
+            LOGGER.info(
+                "Skipping channel %s during picker discovery because message history is not readable.",
+                channel.id,
+            )
+            return None
+        except discord.HTTPException:
+            LOGGER.exception(
+                "Unable to scan channel %s for an existing picker message.",
+                channel.id,
+            )
+            return None
+
+        if not candidate_messages:
+            return None
+
+        if len(candidate_messages) > 1:
+            LOGGER.warning(
+                "Found %s picker-like messages in channel %s; reusing the newest one.",
+                len(candidate_messages),
+                channel.id,
+            )
+
+        return candidate_messages[0]
+
+    async def discover_picker_message_for_guild(
+        self,
+        guild: discord.Guild,
+    ) -> Optional[WatchState]:
+        if self.user is None:
+            return None
+
+        me = guild.me or guild.get_member(self.user.id)
+        if me is None:
+            LOGGER.warning(
+                "Unable to resolve the bot member in guild %s during startup picker discovery.",
+                guild.id,
+            )
+            return None
+
+        channels: list[discord.TextChannel | discord.Thread] = [
+            *guild.text_channels,
+            *list(guild.threads),
+        ]
+        LOGGER.info(
+            "Scanning %s channel(s) in guild %s for an existing picker message.",
+            len(channels),
+            guild.id,
+        )
+
+        candidate_messages: list[tuple[discord.TextChannel | discord.Thread, discord.Message]] = []
+        for channel in channels:
+            permissions = channel.permissions_for(me)
+            if not permissions.view_channel or not permissions.read_message_history:
+                continue
+
+            message = await self.find_picker_message_in_channel(channel)
+            if message is None:
+                continue
+
+            candidate_messages.append((channel, message))
+            LOGGER.info(
+                "Found picker candidate for guild %s in channel %s message %s.",
+                guild.id,
+                channel.id,
+                message.id,
+            )
+
+        if not candidate_messages:
+            LOGGER.info(
+                "No existing picker message found for guild %s during startup discovery.",
+                guild.id,
+            )
+            return None
+
+        channel, message = max(candidate_messages, key=lambda item: item[1].id)
+        if len(candidate_messages) > 1:
+            LOGGER.warning(
+                "Found %s picker candidates in guild %s; adopting the newest message %s in channel %s.",
+                len(candidate_messages),
+                guild.id,
+                message.id,
+                channel.id,
+            )
+
+        await self.adopt_picker_message(guild.id, channel, message)
+        LOGGER.warning(
+            "Automatically adopted picker message for guild %s during startup: channel=%s message=%s.",
+            guild.id,
+            channel.id,
+            message.id,
+        )
+        return self.state.get_guild_state(guild.id)
+
+    async def discover_picker_messages_on_startup(
+        self,
+        guilds: list[discord.Guild],
+    ) -> None:
+        recovered_guild_ids: list[int] = []
+        for guild in guilds:
+            recovered_state = await self.discover_picker_message_for_guild(guild)
+            if recovered_state is not None:
+                recovered_guild_ids.append(guild.id)
+
+        if recovered_guild_ids:
+            LOGGER.warning(
+                "Startup picker discovery recovered state for guild(s): %s",
+                ", ".join(str(guild_id) for guild_id in recovered_guild_ids),
+            )
+
+    async def adopt_picker_message(
+        self,
+        guild_id: int,
+        channel: discord.TextChannel | discord.Thread,
+        message: discord.Message,
+    ) -> None:
+        self.state.set_guild_state(
+            guild_id,
+            WatchState(channel_id=channel.id, message_id=message.id),
+        )
+        try:
+            self.state.save(self.state_path)
+        except OSError:
+            LOGGER.exception(
+                "Unable to save picker state for guild %s after adopting message %s.",
+                guild_id,
+                message.id,
+            )
+
+    async def maybe_reuse_existing_picker_message(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | discord.Thread,
+    ) -> Optional[discord.Message]:
+        existing_message = await self.find_picker_message_in_channel(channel)
+        if existing_message is None:
+            return None
+
+        guild_id = interaction.guild.id if interaction.guild is not None else None
+        if guild_id is None:
+            return existing_message
+
+        current_state = self.state.get_guild_state(guild_id)
+        if current_state is not None and current_state.matches(channel.id, existing_message.id):
+            LOGGER.info(
+                "/here reused existing picker message %s in guild %s channel %s.",
+                existing_message.id,
+                guild_id,
+                channel.id,
+            )
+        elif current_state is None:
+            LOGGER.warning(
+                "/here found an existing picker message %s in guild %s channel %s but no state was stored; reusing it.",
+                existing_message.id,
+                guild_id,
+                channel.id,
+            )
+        else:
+            LOGGER.warning(
+                "/here found an existing picker message %s in guild %s channel %s and is rebinding state from channel=%s message=%s.",
+                existing_message.id,
+                guild_id,
+                channel.id,
+                current_state.channel_id,
+                current_state.message_id,
+            )
+
+        await self.adopt_picker_message(guild_id, channel, existing_message)
+        return existing_message
+
+    async def recover_guild_watch_state_from_message(
+        self,
+        guild: discord.Guild,
+        channel_id: int,
+        message_id: int,
+    ) -> Optional[WatchState]:
+        if self.user is None:
+            return None
+
+        try:
+            channel = await self.fetch_channel(channel_id)
+        except discord.HTTPException:
+            LOGGER.warning(
+                "Unable to fetch channel %s while checking for a recoverable picker.",
+                channel_id,
+            )
+            return None
+
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return None
+
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.HTTPException:
+            return None
+
+        if message.author.id != self.user.id or message.content.strip() != WATCH_MESSAGE_TEXT:
+            LOGGER.info(
+                "Message %s in channel %s was not a recoverable picker message.",
+                message.id,
+                channel.id,
+            )
+            return None
+
+        recovered_state = WatchState(channel_id=channel.id, message_id=message.id)
+        current_state = self.state.get_guild_state(guild.id)
+
+        if current_state is None:
+            LOGGER.warning(
+                "Recovered picker state for guild %s from message %s in channel %s.",
+                guild.id,
+                message.id,
+                channel.id,
+            )
+        elif not current_state.matches(channel.id, message.id):
+            LOGGER.warning(
+                "Rebound stale picker state for guild %s from channel=%s message=%s to channel=%s message=%s.",
+                guild.id,
+                current_state.channel_id,
+                current_state.message_id,
+                channel.id,
+                message.id,
+            )
+        else:
+            return current_state
+
+        self.state.set_guild_state(guild.id, recovered_state)
+        try:
+            self.state.save(self.state_path)
+        except OSError:
+            LOGGER.exception(
+                "Recovered picker state for guild %s in memory, but could not save %s.",
+                guild.id,
+                self.state_path,
+            )
+
+        return recovered_state
 
     async def ensure_color_role_position(
         self, guild: discord.Guild, role: discord.Role
@@ -1528,11 +1830,42 @@ async def here(interaction: discord.Interaction) -> None:
     )
 
     if client.get_guild_watch_state(interaction.guild.id) is not None:
+        existing_state = client.get_guild_watch_state(interaction.guild.id)
+        if existing_state is not None and existing_state.channel_id == interaction.channel.id:
+            try:
+                existing_message = await interaction.channel.fetch_message(existing_state.message_id)
+            except discord.HTTPException:
+                existing_message = None
+
+            if (
+                existing_message is not None
+                and client.user is not None
+                and existing_message.author.id == client.user.id
+            ):
+                LOGGER.info(
+                    "/here reused tracked picker message %s in guild %s channel %s.",
+                    existing_message.id,
+                    interaction.guild.id,
+                    interaction.channel.id,
+                )
+                await interaction.response.send_message(
+                    "Using the existing color role message here.",
+                    ephemeral=True,
+                )
+                await client.adopt_picker_message(interaction.guild.id, interaction.channel, existing_message)
+                return
+
         LOGGER.info(
-            "/here skipped because guild %s already has a picker configured.",
+            "/here found existing picker state for guild %s but will still search this channel for a reusable picker message.",
             interaction.guild.id,
         )
-        await interaction.response.send_message("Already set!", ephemeral=True)
+
+    existing_message = await client.maybe_reuse_existing_picker_message(interaction, interaction.channel)
+    if existing_message is not None:
+        await interaction.response.send_message(
+            "Using the existing color role message here.",
+            ephemeral=True,
+        )
         return
 
     await interaction.response.send_message(
